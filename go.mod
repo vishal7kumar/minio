@@ -4,7 +4,6 @@ go 1.16
 
 require (
 	cloud.google.com/go/storage v1.10.0
-	github.com/Azure/azure-pipeline-go v0.2.2
 	github.com/Azure/azure-storage-blob-go v0.10.0
 	github.com/Shopify/sarama v1.30.0
 	github.com/alecthomas/participle v0.2.1
@@ -14,7 +13,6 @@ require (
 	github.com/buger/jsonparser v1.1.1
 	github.com/cespare/xxhash/v2 v2.1.2
 	github.com/cheggaaa/pb v1.0.29
-	github.com/colinmarc/hdfs/v2 v2.2.0
 	github.com/coredns/coredns v1.9.0
 	github.com/coreos/go-oidc v2.1.0+incompatible
 	github.com/cosnicolaou/pbzip2 v1.0.1
@@ -35,7 +33,6 @@ require (
 	github.com/gorilla/mux v1.8.0
 	github.com/hashicorp/golang-lru v0.5.4
 	github.com/inconshreveable/mousetrap v1.0.0
-	github.com/jcmturner/gokrb5/v8 v8.4.2
 	github.com/json-iterator/go v1.1.12
 	github.com/klauspost/compress v1.14.4
 	github.com/klauspost/cpuid/v2 v2.0.11

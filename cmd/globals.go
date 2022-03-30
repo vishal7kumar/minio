@@ -68,16 +68,17 @@ const (
 	//    It is 64-character obfuscated version of the account ID.
 	// ```
 	// http://docs.aws.amazon.com/AmazonS3/latest/dev/example-walkthroughs-managing-access-example4.html
-	globalMinioDefaultOwnerID      = "02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4"
-	globalMinioDefaultStorageClass = "STANDARD"
-	globalWindowsOSName            = "windows"
-	globalMacOSName                = "darwin"
-	globalMinioModeFS              = "mode-server-fs"
-	globalMinioModeErasure         = "mode-server-xl"
-	globalMinioModeDistErasure     = "mode-server-distributed-xl"
-	globalMinioModeGatewayPrefix   = "mode-gateway-"
-	globalDirSuffix                = "__XLDIR__"
-	globalDirSuffixWithSlash       = globalDirSuffix + slashSeparator
+	globalMinioDefaultOwnerID          = "02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4"
+	globalMinioDefaultOwnerDisplayName = "minio"
+	globalMinioDefaultStorageClass     = "STANDARD"
+	globalWindowsOSName                = "windows"
+	globalMacOSName                    = "darwin"
+	globalMinioModeFS                  = "mode-server-fs"
+	globalMinioModeErasure             = "mode-server-xl"
+	globalMinioModeDistErasure         = "mode-server-distributed-xl"
+	globalMinioModeGatewayPrefix       = "mode-gateway-"
+	globalDirSuffix                    = "__XLDIR__"
+	globalDirSuffixWithSlash           = globalDirSuffix + slashSeparator
 
 	// Add new global values here.
 )
@@ -102,7 +103,7 @@ const (
 	GlobalStaleUploadsCleanupInterval = time.Hour * 6 // 6 hrs.
 
 	// Refresh interval to update in-memory iam config cache.
-	globalRefreshIAMInterval = 30 * time.Minute
+	globalRefreshIAMInterval = 5 * time.Minute
 
 	// Limit of location constraint XML for unauthenticated PUT bucket operations.
 	maxLocationConstraintSize = 3 * humanize.MiByte
@@ -190,7 +191,7 @@ var (
 	globalBucketTargetSys    *BucketTargetSys
 	// globalAPIConfig controls S3 API requests throttling,
 	// healthcheck readiness deadlines and cors settings.
-	globalAPIConfig = apiConfig{listQuorum: "strict"}
+	globalAPIConfig = apiConfig{listQuorum: -1}
 
 	globalStorageClass storageclass.Config
 	globalLDAPConfig   xldap.Config
@@ -347,10 +348,16 @@ var (
 	globalRootDiskThreshold uint64
 
 	// Used for collecting stats for netperf
+
 	globalNetPerfMinDuration = time.Second * 10
 	globalNetPerfRX          netPerfRX
 
+	//Use to set custom owner id and display name
+	globalOwnerID          = globalMinioDefaultOwnerID
+	globalOwnerDisplayName = globalMinioDefaultOwnerDisplayName
+
 	// Add new variable global values here.
+
 )
 
 var errSelfTestFailure = errors.New("self test failed. unsafe to start server")

@@ -62,17 +62,19 @@ const (
 
 	EnvUpdate = "MINIO_UPDATE"
 
-	EnvKMSSecretKey      = "MINIO_KMS_SECRET_KEY"
-	EnvKMSSecretKeyFile  = "MINIO_KMS_SECRET_KEY_FILE"
-	EnvKESEndpoint       = "MINIO_KMS_KES_ENDPOINT"
-	EnvKESKeyName        = "MINIO_KMS_KES_KEY_NAME"
-	EnvKESClientKey      = "MINIO_KMS_KES_KEY_FILE"
-	EnvKESClientPassword = "MINIO_KMS_KES_KEY_PASSWORD"
-	EnvKESClientCert     = "MINIO_KMS_KES_CERT_FILE"
-	EnvKESServerCA       = "MINIO_KMS_KES_CAPATH"
+	EnvKMSSecretKey     = "MINIO_KMS_SECRET_KEY"
+	EnvKMSSecretKeyFile = "MINIO_KMS_SECRET_KEY_FILE"
+	EnvKESEndpoint      = "MINIO_KMS_KES_ENDPOINT"
+	EnvKESKeyName       = "MINIO_KMS_KES_KEY_NAME"
+	EnvKESClientKey     = "MINIO_KMS_KES_KEY_FILE"
+	EnvKESClientCert    = "MINIO_KMS_KES_CERT_FILE"
+	EnvKESServerCA      = "MINIO_KMS_KES_CAPATH"
 
 	EnvEndpoints  = "MINIO_ENDPOINTS"   // legacy
 	EnvWorm       = "MINIO_WORM"        // legacy
 	EnvRegion     = "MINIO_REGION"      // legacy
 	EnvRegionName = "MINIO_REGION_NAME" // legacy
+
+	EnvOwnerID          = "MINIO_OWNER_ID"
+	EnvOwnerDisplayName = "MINIO_OWNER_DISPLAY_NAME"
 )

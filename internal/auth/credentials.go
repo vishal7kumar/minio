@@ -38,7 +38,7 @@ const (
 
 	// Maximum length for MinIO access key.
 	// There is no max length enforcement for access keys
-	accessKeyMaxLen = 20
+	accessKeyMaxLen = 30
 
 	// Minimum length for MinIO secret key for both server and gateway mode.
 	secretKeyMinLen = 8

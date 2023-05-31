@@ -753,6 +753,9 @@ func initFormatErasure(ctx context.Context, storageDisks []StorageAPI, setCount,
 		hostCount := make(map[string]int, setDriveCount)
 		for j := 0; j < setDriveCount; j++ {
 			disk := storageDisks[i*setDriveCount+j]
+			if disk == nil {
+				continue
+			}
 			newFormat := format.Clone()
 			newFormat.Erasure.This = format.Erasure.Sets[i][j]
 			if distributionAlgo != "" {
@@ -764,26 +767,24 @@ func initFormatErasure(ctx context.Context, storageDisks []StorageAPI, setCount,
 			hostCount[disk.Hostname()]++
 			formats[i*setDriveCount+j] = newFormat
 		}
-		if len(hostCount) > 0 {
-			var once sync.Once
-			for host, count := range hostCount {
-				if count > wantAtMost {
-					if host == "" {
-						host = "local"
-					}
-					once.Do(func() {
-						if len(hostCount) == 1 {
-							return
-						}
-						logger.Info(" * Set %v:", i+1)
-						for j := 0; j < setDriveCount; j++ {
-							disk := storageDisks[i*setDriveCount+j]
-							logger.Info("   - Drive: %s", disk.String())
-						}
-					})
-					logger.Info(color.Yellow("WARNING:")+" Host %v has more than %v drives of set. "+
-						"A host failure will result in data becoming unavailable.", host, wantAtMost)
+		var once sync.Once
+		for host, count := range hostCount {
+			if count > wantAtMost {
+				if host == "" {
+					host = "local"
 				}
+				once.Do(func() {
+					if len(hostCount) == 1 {
+						return
+					}
+					logger.Info(" * Set %v:", i+1)
+					for j := 0; j < setDriveCount; j++ {
+						disk := storageDisks[i*setDriveCount+j]
+						logger.Info("   - Drive: %s", disk.String())
+					}
+				})
+				logger.Info(color.Yellow("WARNING:")+" Host %v has more than %v drives of set. "+
+					"A host failure will result in data becoming unavailable.", host, wantAtMost)
 			}
 		}
 	}

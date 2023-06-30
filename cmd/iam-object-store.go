@@ -448,7 +448,7 @@ func (iamOS *IAMObjectStore) listAllIAMConfigItems(ctx context.Context) (map[str
 			}
 		}
 
-		if !found && !(item.Item != "format.json") {
+		if !found && (item.Item != "format.json") {
 			logger.LogIf(ctx, fmt.Errorf("unknown type of IAM file listed: %v", item.Item))
 		}
 	}

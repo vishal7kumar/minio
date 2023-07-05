@@ -28,7 +28,7 @@ import (
 
 const unavailable = "offline"
 
-func shouldProxy() bool {
+func isServerInitialized() bool {
 	return newObjectLayerFn() == nil
 }
 
@@ -41,7 +41,7 @@ func ClusterCheckHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := newContext(r, w, "ClusterCheckHandler")
 
-	if shouldProxy() {
+	if isServerInitialized() {
 		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
 		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
 		return
@@ -84,7 +84,7 @@ func ClusterReadCheckHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := newContext(r, w, "ClusterReadCheckHandler")
 
-	if shouldProxy() {
+	if isServerInitialized() {
 		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
 		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
 		return
@@ -111,9 +111,23 @@ func ReadinessCheckHandler(w http.ResponseWriter, r *http.Request) {
 
 // LivenessCheckHandler - Checks if the process is up. Always returns success.
 func LivenessCheckHandler(w http.ResponseWriter, r *http.Request) {
-	if shouldProxy() {
+	if isServerInitialized() {
 		// Service not initialized yet
 		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
+	}
+
+	// Verify if KMS is reachable if its configured
+	if GlobalKMS != nil {
+		if _, err := GlobalKMS.Stat(); err != nil {
+			switch r.Method {
+			case http.MethodHead:
+				apiErr := toAPIError(r.Context(), err)
+				writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
+			case http.MethodGet:
+				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
+			}
+			return
+		}
 	}
 
 	if globalIsGateway {

@@ -1177,6 +1177,8 @@ func replicateObjectToTarget(ctx context.Context, ri ReplicateObjectInfo, object
 
 func replicateObjectWithMultipart(ctx context.Context, c *miniogo.Core, bucket, object string, r io.Reader, objInfo ObjectInfo, opts miniogo.PutObjectOptions) (err error) {
 	var uploadedParts []miniogo.CompletePart
+	// new multipart must not set mtime as it may lead to erroneous cleanups at various intervals.
+	opts.Internal.SourceMTime = time.Time{} // this value is saved properly in CompleteMultipartUpload()
 	uploadID, err := c.NewMultipartUpload(context.Background(), bucket, object, opts)
 	if err != nil {
 		return err

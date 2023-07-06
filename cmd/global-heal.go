@@ -218,7 +218,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			disks = disks[:3]
 		}
 
-		healEntry := func(entry metaCacheEntry) {
+		healEntry := func(bucket string, entry metaCacheEntry) {
 			if entry.name == "" && len(entry.metadata) == 0 {
 				// ignore entries that don't have metadata.
 				return
@@ -227,6 +227,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 				// ignore healing entry.name's with `/` suffix.
 				return
 			}
+
 			// We might land at .metacache, .trash, .multipart
 			// no need to heal them skip, only when bucket
 			// is '.minio.sys'
@@ -250,6 +251,11 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 					versionID: "",
 				}, madmin.HealItemObject)
 				if err != nil {
+					if isErrObjectNotFound(err) {
+						// queueing happens across namespace, ignore
+						// objects that are not found.
+						return
+					}
 					tracker.ItemsFailed++
 					logger.LogIf(ctx, fmt.Errorf("unable to heal object %s/%s: %w", bucket, entry.name, err))
 				} else {
@@ -288,21 +294,26 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			waitForLowHTTPReq()
 		}
 
+		actualBucket, prefix := path2BucketObject(bucket)
+
 		// How to resolve partial results.
 		resolver := metadataResolutionParams{
 			dirQuorum: 1,
 			objQuorum: 1,
-			bucket:    bucket,
+			bucket: actualBucket,
 		}
 
 		err := listPathRaw(ctx, listPathRawOptions{
 			disks:          disks,
-			bucket:         bucket,
+			bucket:         actualBucket,
+			path:           prefix,
 			recursive:      true,
 			forwardTo:      forwardTo,
 			minDisks:       1,
 			reportNotFound: false,
-			agreed:         healEntry,
+			agreed:         func(entry metaCacheEntry) {
+				healEntry(actualBucket, entry)
+			},
 			partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
 				entry, ok := entries.resolve(&resolver)
 				if !ok {
@@ -310,7 +321,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 					// proceed to heal nonetheless.
 					entry, _ = entries.firstFound()
 				}
-				healEntry(*entry)
+				healEntry(actualBucket, *entry)
 			},
 			finished: nil,
 		})

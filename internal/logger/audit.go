@@ -18,114 +18,19 @@
 package logger
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
-	"sync/atomic"
 	"time"
 
-	"github.com/klauspost/compress/gzhttp"
+	internalAudit "github.com/minio/minio/internal/logger/message/audit"
+	"github.com/minio/minio/internal/mcontext"
+	"github.com/minio/pkg/logger/message/audit"
+
+	"github.com/minio/madmin-go/v3"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger/message/audit"
 )
-
-// ResponseWriter - is a wrapper to trap the http response status code.
-type ResponseWriter struct {
-	http.ResponseWriter
-	StatusCode int
-	// Log body of 4xx or 5xx responses
-	LogErrBody bool
-	// Log body of all responses
-	LogAllBody bool
-
-	TimeToFirstByte time.Duration
-	StartTime       time.Time
-	// number of bytes written
-	bytesWritten int
-	// Internal recording buffer
-	headers bytes.Buffer
-	body    bytes.Buffer
-	// Indicate if headers are written in the log
-	headersLogged bool
-}
-
-// NewResponseWriter - returns a wrapped response writer to trap
-// http status codes for auditing purposes.
-func NewResponseWriter(w http.ResponseWriter) *ResponseWriter {
-	return &ResponseWriter{
-		ResponseWriter: w,
-		StatusCode:     http.StatusOK,
-		StartTime:      time.Now().UTC(),
-	}
-}
-
-func (lrw *ResponseWriter) Write(p []byte) (int, error) {
-	if !lrw.headersLogged {
-		// We assume the response code to be '200 OK' when WriteHeader() is not called,
-		// that way following Golang HTTP response behavior.
-		lrw.WriteHeader(http.StatusOK)
-	}
-	n, err := lrw.ResponseWriter.Write(p)
-	lrw.bytesWritten += n
-	if lrw.TimeToFirstByte == 0 {
-		lrw.TimeToFirstByte = time.Now().UTC().Sub(lrw.StartTime)
-	}
-	if (lrw.LogErrBody && lrw.StatusCode >= http.StatusBadRequest) || lrw.LogAllBody {
-		// Always logging error responses.
-		lrw.body.Write(p)
-	}
-	if err != nil {
-		return n, err
-	}
-	return n, err
-}
-
-// Write the headers into the given buffer
-func (lrw *ResponseWriter) writeHeaders(w io.Writer, statusCode int, headers http.Header) {
-	n, _ := fmt.Fprintf(w, "%d %s\n", statusCode, http.StatusText(statusCode))
-	lrw.bytesWritten += n
-	for k, v := range headers {
-		n, _ := fmt.Fprintf(w, "%s: %s\n", k, v[0])
-		lrw.bytesWritten += n
-	}
-}
-
-// BodyPlaceHolder returns a dummy body placeholder
-var BodyPlaceHolder = []byte("<BODY>")
-
-// Body - Return response body.
-func (lrw *ResponseWriter) Body() []byte {
-	// If there was an error response or body logging is enabled
-	// then we return the body contents
-	if (lrw.LogErrBody && lrw.StatusCode >= http.StatusBadRequest) || lrw.LogAllBody {
-		return lrw.body.Bytes()
-	}
-	// ... otherwise we return the <BODY> place holder
-	return BodyPlaceHolder
-}
-
-// WriteHeader - writes http status code
-func (lrw *ResponseWriter) WriteHeader(code int) {
-	if !lrw.headersLogged {
-		lrw.StatusCode = code
-		lrw.writeHeaders(&lrw.headers, code, lrw.ResponseWriter.Header())
-		lrw.headersLogged = true
-		lrw.ResponseWriter.WriteHeader(code)
-	}
-}
-
-// Flush - Calls the underlying Flush.
-func (lrw *ResponseWriter) Flush() {
-	lrw.ResponseWriter.(http.Flusher).Flush()
-}
-
-// Size - reutrns the number of bytes written
-func (lrw *ResponseWriter) Size() int {
-	return lrw.bytesWritten
-}
 
 const contextAuditKey = contextKeyType("audit-entry")
 
@@ -146,11 +51,10 @@ func GetAuditEntry(ctx context.Context) *audit.Entry {
 			return r
 		}
 		r = &audit.Entry{
-			Version:      audit.Version,
+			Version:      internalAudit.Version,
 			DeploymentID: xhttp.GlobalDeploymentID,
 			Time:         time.Now().UTC(),
 		}
-		SetAuditEntry(ctx, r)
 		return r
 	}
 	return nil
@@ -158,20 +62,21 @@ func GetAuditEntry(ctx context.Context) *audit.Entry {
 
 // AuditLog - logs audit logs to all audit targets.
 func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqClaims map[string]interface{}, filterKeys ...string) {
-	// Fast exit if there is not audit target configured
-	if atomic.LoadInt32(&nAuditTargets) == 0 {
+	auditTgts := AuditTargets()
+	if len(auditTgts) == 0 {
 		return
 	}
 
 	var entry audit.Entry
-
 	if w != nil && r != nil {
 		reqInfo := GetReqInfo(ctx)
 		if reqInfo == nil {
 			return
 		}
+		reqInfo.RLock()
+		defer reqInfo.RUnlock()
 
-		entry = audit.ToEntry(w, r, reqClaims, xhttp.GlobalDeploymentID)
+		entry = internalAudit.ToEntry(w, r, reqClaims, xhttp.GlobalDeploymentID)
 		// indicates all requests for this API call are inbound
 		entry.Trigger = "incoming"
 
@@ -187,24 +92,20 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 			timeToResponse  time.Duration
 			timeToFirstByte time.Duration
 			outputBytes     int64 = -1 // -1: unknown output bytes
+			headerBytes     int64
 		)
 
-		var st *ResponseWriter
-		switch v := w.(type) {
-		case *ResponseWriter:
-			st = v
-		case *gzhttp.GzipResponseWriter:
-			// the writer may be obscured by gzip response writer
-			if rw, ok := v.ResponseWriter.(*ResponseWriter); ok {
-				st = rw
-			}
+		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+		if ok {
+			statusCode = tc.ResponseRecorder.StatusCode
+			outputBytes = int64(tc.ResponseRecorder.Size())
+			headerBytes = int64(tc.ResponseRecorder.HeaderSize())
+			timeToResponse = time.Now().UTC().Sub(tc.ResponseRecorder.StartTime)
+			timeToFirstByte = tc.ResponseRecorder.TimeToFirstByte
 		}
-		if st != nil {
-			statusCode = st.StatusCode
-			timeToResponse = time.Now().UTC().Sub(st.StartTime)
-			timeToFirstByte = st.TimeToFirstByte
-			outputBytes = int64(st.Size())
-		}
+
+		entry.AccessKey = reqInfo.Cred.AccessKey
+		entry.ParentUser = reqInfo.Cred.ParentUser
 
 		entry.API.Name = reqInfo.API
 		entry.API.Bucket = reqInfo.BucketName
@@ -220,11 +121,19 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 		entry.API.StatusCode = statusCode
 		entry.API.InputBytes = r.ContentLength
 		entry.API.OutputBytes = outputBytes
+		entry.API.HeaderBytes = headerBytes
 		entry.API.TimeToResponse = strconv.FormatInt(timeToResponse.Nanoseconds(), 10) + "ns"
-		entry.Tags = reqInfo.GetTagsMap()
-		// ttfb will be recorded only for GET requests, Ignore such cases where ttfb will be empty.
+		entry.API.TimeToResponseInNS = strconv.FormatInt(timeToResponse.Nanoseconds(), 10)
+		// We hold the lock, so we cannot call reqInfo.GetTagsMap().
+		tags := make(map[string]interface{}, len(reqInfo.tags))
+		for _, t := range reqInfo.tags {
+			tags[t.Key] = t.Val
+		}
+		entry.Tags = tags
+		// ignore cases for ttfb when its zero.
 		if timeToFirstByte != 0 {
 			entry.API.TimeToFirstByte = strconv.FormatInt(timeToFirstByte.Nanoseconds(), 10) + "ns"
+			entry.API.TimeToFirstByteInNS = strconv.FormatInt(timeToFirstByte.Nanoseconds(), 10)
 		}
 	} else {
 		auditEntry := GetAuditEntry(ctx)
@@ -234,9 +143,9 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 	}
 
 	// Send audit logs only to http targets.
-	for _, t := range AuditTargets() {
-		if err := t.Send(entry, string(All)); err != nil {
-			LogAlwaysIf(context.Background(), fmt.Errorf("event(%v) was not sent to Audit target (%v): %v", entry, t, err), All)
+	for _, t := range auditTgts {
+		if err := t.Send(ctx, entry); err != nil {
+			LogAlwaysIf(context.Background(), fmt.Errorf("event(%v) was not sent to Audit target (%v): %v", entry, t, err), madmin.LogKindAll)
 		}
 	}
 }

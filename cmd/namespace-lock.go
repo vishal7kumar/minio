@@ -39,9 +39,9 @@ var globalLockServer *localLocker
 // RWLocker - locker interface to introduce GetRLock, RUnlock.
 type RWLocker interface {
 	GetLock(ctx context.Context, timeout *dynamicTimeout) (lkCtx LockContext, timedOutErr error)
-	Unlock(cancel context.CancelFunc)
+	Unlock(lkCtx LockContext)
 	GetRLock(ctx context.Context, timeout *dynamicTimeout) (lkCtx LockContext, timedOutErr error)
-	RUnlock(cancel context.CancelFunc)
+	RUnlock(lkCtx LockContext)
 }
 
 // LockContext lock context holds the lock backed context and canceler for the context.
@@ -166,12 +166,12 @@ func (di *distLockInstance) GetLock(ctx context.Context, timeout *dynamicTimeout
 
 	newCtx, cancel := context.WithCancel(ctx)
 	if !di.rwMutex.GetLock(newCtx, cancel, di.opsID, lockSource, dsync.Options{
-		Timeout: timeout.Timeout(),
+		Timeout:       timeout.Timeout(),
+		RetryInterval: timeout.RetryInterval(),
 	}) {
 		timeout.LogFailure()
-		cancel()
-		switch err := newCtx.Err(); err {
-		case context.Canceled:
+		defer cancel()
+		if err := newCtx.Err(); err == context.Canceled {
 			return LockContext{ctx: ctx, cancel: func() {}}, err
 		}
 		return LockContext{ctx: ctx, cancel: func() {}}, OperationTimedOut{}
@@ -181,11 +181,11 @@ func (di *distLockInstance) GetLock(ctx context.Context, timeout *dynamicTimeout
 }
 
 // Unlock - block until write lock is released.
-func (di *distLockInstance) Unlock(cancel context.CancelFunc) {
-	if cancel != nil {
-		cancel()
+func (di *distLockInstance) Unlock(lc LockContext) {
+	if lc.cancel != nil {
+		lc.cancel()
 	}
-	di.rwMutex.Unlock()
+	di.rwMutex.Unlock(lc.ctx)
 }
 
 // RLock - block until read lock is taken or timeout has occurred.
@@ -195,13 +195,13 @@ func (di *distLockInstance) GetRLock(ctx context.Context, timeout *dynamicTimeou
 
 	newCtx, cancel := context.WithCancel(ctx)
 	if !di.rwMutex.GetRLock(ctx, cancel, di.opsID, lockSource, dsync.Options{
-		Timeout: timeout.Timeout(),
+		Timeout:       timeout.Timeout(),
+		RetryInterval: timeout.RetryInterval(),
 	}) {
 		timeout.LogFailure()
-		cancel()
-		switch err := newCtx.Err(); err {
-		case context.Canceled:
-			return LockContext{ctx: ctx, cancel: func() {}}, err
+		defer cancel()
+		if errors.Is(newCtx.Err(), context.Canceled) {
+			return LockContext{ctx: ctx, cancel: func() {}}, newCtx.Err()
 		}
 		return LockContext{ctx: ctx, cancel: func() {}}, OperationTimedOut{}
 	}
@@ -210,11 +210,11 @@ func (di *distLockInstance) GetRLock(ctx context.Context, timeout *dynamicTimeou
 }
 
 // RUnlock - block until read lock is released.
-func (di *distLockInstance) RUnlock(cancel context.CancelFunc) {
-	if cancel != nil {
-		cancel()
+func (di *distLockInstance) RUnlock(lc LockContext) {
+	if lc.cancel != nil {
+		lc.cancel()
 	}
-	di.rwMutex.RUnlock()
+	di.rwMutex.RUnlock(lc.ctx)
 }
 
 // localLockInstance - frontend/top-level interface for namespace locks.
@@ -255,9 +255,8 @@ func (li *localLockInstance) GetLock(ctx context.Context, timeout *dynamicTimeou
 					li.ns.unlock(li.volume, li.paths[si], readLock)
 				}
 			}
-			switch err := ctx.Err(); err {
-			case context.Canceled:
-				return LockContext{}, err
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return LockContext{}, ctx.Err()
 			}
 			return LockContext{}, OperationTimedOut{}
 		}
@@ -268,9 +267,9 @@ func (li *localLockInstance) GetLock(ctx context.Context, timeout *dynamicTimeou
 }
 
 // Unlock - block until write lock is released.
-func (li *localLockInstance) Unlock(cancel context.CancelFunc) {
-	if cancel != nil {
-		cancel()
+func (li *localLockInstance) Unlock(lc LockContext) {
+	if lc.cancel != nil {
+		lc.cancel()
 	}
 	const readLock = false
 	for _, path := range li.paths {
@@ -292,8 +291,7 @@ func (li *localLockInstance) GetRLock(ctx context.Context, timeout *dynamicTimeo
 					li.ns.unlock(li.volume, li.paths[si], readLock)
 				}
 			}
-			switch err := ctx.Err(); err {
-			case context.Canceled:
+			if err := ctx.Err(); err == context.Canceled {
 				return LockContext{}, err
 			}
 			return LockContext{}, OperationTimedOut{}
@@ -305,9 +303,9 @@ func (li *localLockInstance) GetRLock(ctx context.Context, timeout *dynamicTimeo
 }
 
 // RUnlock - block until read lock is released.
-func (li *localLockInstance) RUnlock(cancel context.CancelFunc) {
-	if cancel != nil {
-		cancel()
+func (li *localLockInstance) RUnlock(lc LockContext) {
+	if lc.cancel != nil {
+		lc.cancel()
 	}
 	const readLock = true
 	for _, path := range li.paths {

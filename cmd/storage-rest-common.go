@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2022 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,7 +18,7 @@
 package cmd
 
 const (
-	storageRESTVersion       = "v43" // Added DiskMTime field for FileInfo
+	storageRESTVersion       = "v49" // Added RenameData() to return versions
 	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
 	storageRESTPrefix        = minioReservedBucketPath + "/storage"
 )
@@ -40,6 +40,7 @@ const (
 	storageRESTMethodUpdateMetadata = "/updatemetadata"
 	storageRESTMethodDeleteVersion  = "/deleteversion"
 	storageRESTMethodReadVersion    = "/readversion"
+	storageRESTMethodReadXL         = "/readxl"
 	storageRESTMethodRenameData     = "/renamedata"
 	storageRESTMethodCheckParts     = "/checkparts"
 	storageRESTMethodReadAll        = "/readall"
@@ -52,6 +53,8 @@ const (
 	storageRESTMethodVerifyFile     = "/verifyfile"
 	storageRESTMethodWalkDir        = "/walkdir"
 	storageRESTMethodStatInfoFile   = "/statfile"
+	storageRESTMethodReadMultiple   = "/readmultiple"
+	storageRESTMethodCleanAbandoned = "/cleanabandoned"
 )
 
 const (
@@ -79,4 +82,5 @@ const (
 	storageRESTDiskID         = "disk-id"
 	storageRESTForceDelete    = "force-delete"
 	storageRESTGlob           = "glob"
+	storageRESTScanMode       = "scan-mode"
 )

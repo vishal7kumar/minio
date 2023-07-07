@@ -35,7 +35,7 @@ func (j xlMetaV2Object) InitFreeVersion(fi FileInfo) (xlMetaV2Version, bool) {
 		if err != nil {
 			panic(fmt.Errorf("Invalid Tier Object delete marker versionId %s %v", fi.TierFreeVersionID(), err))
 		}
-		freeEntry := xlMetaV2Version{Type: DeleteType}
+		freeEntry := xlMetaV2Version{Type: DeleteType, WrittenByVersion: globalVersionUnix}
 		freeEntry.DeleteMarker = &xlMetaV2DeleteMarker{
 			VersionID: vID,
 			ModTime:   j.ModTime, // fi.ModTime may be empty
@@ -66,8 +66,7 @@ func (j xlMetaV2DeleteMarker) FreeVersion() bool {
 
 // FreeVersion returns true if j represents a free-version, false otherwise.
 func (j xlMetaV2Version) FreeVersion() bool {
-	switch j.Type {
-	case DeleteType:
+	if j.Type == DeleteType {
 		return j.DeleteMarker.FreeVersion()
 	}
 	return false

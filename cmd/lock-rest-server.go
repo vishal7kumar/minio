@@ -25,8 +25,8 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/gorilla/mux"
 	"github.com/minio/minio/internal/dsync"
+	"github.com/minio/mux"
 )
 
 const (
@@ -43,7 +43,17 @@ type lockRESTServer struct {
 }
 
 func (l *lockRESTServer) writeErrorResponse(w http.ResponseWriter, err error) {
-	w.WriteHeader(http.StatusForbidden)
+	statusCode := http.StatusForbidden
+	switch err {
+	case errLockNotInitialized:
+		// Return 425 instead of 5xx, otherwise this node will be marked offline
+		statusCode = http.StatusTooEarly
+	case errLockConflict:
+		statusCode = http.StatusConflict
+	case errLockNotFound:
+		statusCode = http.StatusNotFound
+	}
+	w.WriteHeader(statusCode)
 	w.Write([]byte(err.Error()))
 }
 
@@ -63,7 +73,7 @@ func (l *lockRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
 
 func getLockArgs(r *http.Request) (args dsync.LockArgs, err error) {
 	dec := msgpNewReader(io.LimitReader(r.Body, 1000*humanize.KiByte))
-	defer readMsgpReaderPool.Put(dec)
+	defer readMsgpReaderPoolPut(dec)
 	err = args.DecodeMsg(dec)
 	return args, err
 }
@@ -209,22 +219,7 @@ func (l *lockRESTServer) ForceUnlockHandler(w http.ResponseWriter, r *http.Reque
 // lockMaintenance loops over all locks and discards locks
 // that have not been refreshed for some time.
 func lockMaintenance(ctx context.Context) {
-	// Wait until the object API is ready
-	// no need to start the lock maintenance
-	// if ObjectAPI is not initialized.
-
-	var objAPI ObjectLayer
-
-	for {
-		objAPI = newObjectLayerFn()
-		if objAPI == nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		break
-	}
-
-	if _, ok := objAPI.(*erasureServerPools); !ok {
+	if !globalIsDistErasure {
 		return
 	}
 
@@ -239,10 +234,10 @@ func lockMaintenance(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-lkTimer.C:
+			globalLockServer.expireOldLocks(lockValidityDuration)
+
 			// Reset the timer for next cycle.
 			lkTimer.Reset(lockMaintenanceInterval)
-
-			globalLockServer.expireOldLocks(lockValidityDuration)
 		}
 	}
 }

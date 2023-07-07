@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -108,12 +107,13 @@ func getAnonWriteOnlyObjectPolicy(bucketName, prefix string) *policy.Policy {
 
 // Wrapper for calling Create Bucket and ensure we get one and only one success.
 func TestCreateBucket(t *testing.T) {
-	ExecObjectLayerAPITest(t, testCreateBucket, []string{"MakeBucketWithLocation"})
+	ExecObjectLayerAPITest(t, testCreateBucket, []string{"MakeBucket"})
 }
 
 // testCreateBucket - Test for calling Create Bucket and ensure we get one and only one success.
 func testCreateBucket(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	credentials auth.Credentials, t *testing.T) {
+	credentials auth.Credentials, t *testing.T,
+) {
 	bucketName1 := fmt.Sprintf("%s-1", bucketName)
 
 	const n = 100
@@ -127,7 +127,7 @@ func testCreateBucket(obj ObjectLayer, instanceType, bucketName string, apiRoute
 			defer wg.Done()
 			// Sync start.
 			<-start
-			if err := obj.MakeBucketWithLocation(GlobalContext, bucketName1, BucketOptions{}); err != nil {
+			if err := obj.MakeBucket(GlobalContext, bucketName1, MakeBucketOptions{}); err != nil {
 				if _, ok := err.(BucketExists); !ok {
 					t.Logf("unexpected error: %T: %v", err, err)
 					return
@@ -162,7 +162,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	credentials auth.Credentials, t *testing.T,
 ) {
 	bucketName1 := fmt.Sprintf("%s-1", bucketName)
-	if err := obj.MakeBucketWithLocation(GlobalContext, bucketName1, BucketOptions{}); err != nil {
+	if err := obj.MakeBucket(GlobalContext, bucketName1, MakeBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -378,7 +378,8 @@ func TestGetBucketPolicyHandler(t *testing.T) {
 
 // testGetBucketPolicyHandler - Test for end point which fetches the access policy json of the given bucket.
 func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	credentials auth.Credentials, t *testing.T) {
+	credentials auth.Credentials, t *testing.T,
+) {
 	// template for constructing HTTP request body for PUT bucket policy.
 	bucketPolicyTemplate := `{"Version":"2012-10-17","Statement":[{"Action":["s3:GetBucketLocation","s3:ListBucket"],"Effect":"Allow","Principal":{"AWS":["*"]},"Resource":["arn:aws:s3:::%s"]},{"Action":["s3:GetObject"],"Effect":"Allow","Principal":{"AWS":["*"]},"Resource":["arn:aws:s3:::%s/this*"]}]}`
 
@@ -485,7 +486,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 			t.Fatalf("Case %d: Expected the response status to be `%d`, but instead found `%d`", i+1, testCase.expectedRespStatus, recV4.Code)
 		}
 		// read the response body.
-		bucketPolicyReadBuf, err := ioutil.ReadAll(recV4.Body)
+		bucketPolicyReadBuf, err := io.ReadAll(recV4.Body)
 		if err != nil {
 			t.Fatalf("Test %d: %s: Failed parsing response body: <ERROR> %v", i+1, instanceType, err)
 		}
@@ -523,7 +524,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 			t.Fatalf("Case %d: Expected the response status to be `%d`, but instead found `%d`", i+1, testCase.expectedRespStatus, recV2.Code)
 		}
 		// read the response body.
-		bucketPolicyReadBuf, err = ioutil.ReadAll(recV2.Body)
+		bucketPolicyReadBuf, err = io.ReadAll(recV2.Body)
 		if err != nil {
 			t.Fatalf("Test %d: %s: Failed parsing response body: <ERROR> %v", i+1, instanceType, err)
 		}

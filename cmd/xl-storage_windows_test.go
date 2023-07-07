@@ -24,8 +24,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"testing"
 )
 
@@ -42,16 +40,10 @@ func TestUNCPaths(t *testing.T) {
 		{string(bytes.Repeat([]byte("界"), 280)), false},
 		{`/p/q/r/s/t`, true},
 	}
-	dir, err := ioutil.TempDir("", "testdisk-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Cleanup on exit of test
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// Instantiate posix object to manage a disk
-	var fs StorageAPI
-	fs, err = newLocalXLStorage(dir)
+	fs, err := newLocalXLStorage(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +62,10 @@ func TestUNCPaths(t *testing.T) {
 			} else if err == nil && !test.pass {
 				t.Error(err)
 			}
-			fs.Delete(context.Background(), "voldir", test.objName, false)
+			fs.Delete(context.Background(), "voldir", test.objName, DeleteOptions{
+				Recursive: false,
+				Force:     false,
+			})
 		})
 	}
 }
@@ -78,15 +73,9 @@ func TestUNCPaths(t *testing.T) {
 // Test to validate xlStorage behavior on windows when a non-final path component is a file.
 func TestUNCPathENOTDIR(t *testing.T) {
 	// Instantiate posix object to manage a disk
-	dir, err := ioutil.TempDir("", "testdisk-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Cleanup on exit of test
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
-	var fs StorageAPI
-	fs, err = newLocalXLStorage(dir)
+	fs, err := newLocalXLStorage(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

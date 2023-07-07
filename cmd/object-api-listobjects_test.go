@@ -23,8 +23,6 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -35,9 +33,6 @@ func TestListObjectsVersionedFolders(t *testing.T) {
 }
 
 func testListObjectsVersionedFolders(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
-	if instanceType == FSTestStr {
-		return
-	}
 	t, _ := t1.(*testing.T)
 	testBuckets := []string{
 		// This bucket is used for testing ListObject operations.
@@ -46,7 +41,7 @@ func testListObjectsVersionedFolders(obj ObjectLayer, instanceType string, t1 Te
 		"test-bucket-files",
 	}
 	for _, bucket := range testBuckets {
-		err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{
 			VersioningEnabled: true,
 		})
 		if err != nil {
@@ -70,7 +65,7 @@ func testListObjectsVersionedFolders(obj ObjectLayer, instanceType string, t1 Te
 		md5Bytes := md5.Sum([]byte(object.content))
 		_, err = obj.PutObject(context.Background(), object.parentBucket, object.name, mustGetPutObjReader(t, bytes.NewBufferString(object.content),
 			int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{
-			Versioned:   globalBucketVersioningSys.Enabled(object.parentBucket),
+			Versioned:   globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
 			UserDefined: object.meta,
 		})
 		if err != nil {
@@ -78,7 +73,7 @@ func testListObjectsVersionedFolders(obj ObjectLayer, instanceType string, t1 Te
 		}
 		if object.addDeleteMarker {
 			oi, err := obj.DeleteObject(context.Background(), object.parentBucket, object.name, ObjectOptions{
-				Versioned: globalBucketVersioningSys.Enabled(object.parentBucket),
+				Versioned: globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
 			})
 			if err != nil {
 				t.Fatalf("%s : %s", instanceType, err.Error())
@@ -317,27 +312,26 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 }
 
 func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, versioned bool) {
-	if instanceType == FSTestStr && versioned {
-		return
-	}
 	t, _ := t1.(*testing.T)
 	testBuckets := []string{
 		// This bucket is used for testing ListObject operations.
-		"test-bucket-list-object",
+		0: "test-bucket-list-object",
 		// This bucket will be tested with empty directories
-		"test-bucket-empty-dir",
+		1: "test-bucket-empty-dir",
 		// Will not store any objects in this bucket,
 		// Its to test ListObjects on an empty bucket.
-		"empty-bucket",
+		2: "empty-bucket",
 		// Listing the case where the marker > last object.
-		"test-bucket-single-object",
+		3: "test-bucket-single-object",
 		// Listing uncommon delimiter.
-		"test-bucket-delimiter",
+		4: "test-bucket-delimiter",
 		// Listing prefixes > maxKeys
-		"test-bucket-max-keys-prefixes",
+		5: "test-bucket-max-keys-prefixes",
+		// Listing custom delimiters
+		6: "test-bucket-custom-delimiter",
 	}
 	for _, bucket := range testBuckets {
-		err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{
 			VersioningEnabled: versioned,
 		})
 		if err != nil {
@@ -374,13 +368,17 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		{testBuckets[5], "foo/201910/2112", "content", nil},
 		{testBuckets[5], "foo/201910_txt", "content", nil},
 		{testBuckets[5], "201910/foo/bar/xl.meta/1.txt", "content", nil},
+		{testBuckets[6], "aaa", "content", nil},
+		{testBuckets[6], "bbb_aaa", "content", nil},
+		{testBuckets[6], "bbb_aaa", "content", nil},
+		{testBuckets[6], "ccc", "content", nil},
 	}
 	for _, object := range testObjects {
 		md5Bytes := md5.Sum([]byte(object.content))
 		_, err = obj.PutObject(context.Background(), object.parentBucket, object.name,
 			mustGetPutObjReader(t, bytes.NewBufferString(object.content),
 				int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{
-				Versioned:   globalBucketVersioningSys.Enabled(object.parentBucket),
+				Versioned:   globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
 				UserDefined: object.meta,
 			})
 		if err != nil {
@@ -796,6 +794,15 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 				{Name: "201910/foo/bar/xl.meta/1.txt"},
 			},
 		},
+		// ListObjectsResult-40
+		{
+			IsTruncated: false,
+			Objects: []ObjectInfo{
+				{Name: "aaa"},
+				{Name: "ccc"},
+			},
+			Prefixes: []string{"bbb_"},
+		},
 	}
 
 	testCases := []struct {
@@ -926,6 +933,8 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		{testBuckets[5], "foo/201910", "", "", 1000, resultCases[38], nil, true},
 		// Test listing with prefix match with 'xl.meta'
 		{testBuckets[5], "201910/foo/bar", "", "", 1000, resultCases[39], nil, true},
+		// Test listing with custom prefix
+		{testBuckets[6], "", "", "_", 1000, resultCases[40], nil, true},
 	}
 
 	for i, testCase := range testCases {
@@ -1020,10 +1029,6 @@ func TestDeleteObjectVersionMarker(t *testing.T) {
 }
 
 func testDeleteObjectVersion(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
-	if instanceType == FSTestStr {
-		return
-	}
-
 	t, _ := t1.(*testing.T)
 
 	testBuckets := []string{
@@ -1031,7 +1036,7 @@ func testDeleteObjectVersion(obj ObjectLayer, instanceType string, t1 TestErrHan
 		"bucket-suspended-version-id",
 	}
 	for _, bucket := range testBuckets {
-		err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{
 			VersioningEnabled: true,
 		})
 		if err != nil {
@@ -1065,16 +1070,16 @@ func testDeleteObjectVersion(obj ObjectLayer, instanceType string, t1 TestErrHan
 		_, err := obj.PutObject(context.Background(), object.parentBucket, object.name,
 			mustGetPutObjReader(t, bytes.NewBufferString(object.content),
 				int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{
-				Versioned:        globalBucketVersioningSys.Enabled(object.parentBucket),
-				VersionSuspended: globalBucketVersioningSys.Suspended(object.parentBucket),
+				Versioned:        globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
+				VersionSuspended: globalBucketVersioningSys.PrefixSuspended(object.parentBucket, object.name),
 				UserDefined:      object.meta,
 			})
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err)
 		}
 		obj, err := obj.DeleteObject(context.Background(), object.parentBucket, object.name, ObjectOptions{
-			Versioned:        globalBucketVersioningSys.Enabled(object.parentBucket),
-			VersionSuspended: globalBucketVersioningSys.Suspended(object.parentBucket),
+			Versioned:        globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
+			VersionSuspended: globalBucketVersioningSys.PrefixSuspended(object.parentBucket, object.name),
 			VersionID:        object.versionID,
 		})
 		if err != nil {
@@ -1101,10 +1106,6 @@ func TestListObjectVersions(t *testing.T) {
 
 // Unit test for ListObjectVersions
 func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
-	if instanceType == FSTestStr {
-		return
-	}
-
 	t, _ := t1.(*testing.T)
 	testBuckets := []string{
 		// This bucket is used for testing ListObject operations.
@@ -1122,7 +1123,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		"test-bucket-max-keys-prefixes",
 	}
 	for _, bucket := range testBuckets {
-		err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{VersioningEnabled: true})
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{VersioningEnabled: true})
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
@@ -1752,7 +1753,7 @@ func testListObjectsContinuation(obj ObjectLayer, instanceType string, t1 TestEr
 		"test-bucket-list-object-continuation-2",
 	}
 	for _, bucket := range testBuckets {
-		err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
@@ -1785,7 +1786,7 @@ func testListObjectsContinuation(obj ObjectLayer, instanceType string, t1 TestEr
 
 	}
 
-	// Formualting the result data set to be expected from ListObjects call inside the tests,
+	// Formulating the result data set to be expected from ListObjects call inside the tests,
 	// This will be used in testCases and used for asserting the correctness of ListObjects output in the tests.
 
 	resultCases := []ListObjectsInfo{
@@ -1886,34 +1887,28 @@ func testListObjectsContinuation(obj ObjectLayer, instanceType string, t1 TestEr
 
 // Initialize FS backend for the benchmark.
 func initFSObjectsB(disk string, t *testing.B) (obj ObjectLayer) {
-	var err error
-	obj, err = NewFSObjectLayer(disk)
+	obj, _, err := initObjectLayer(context.Background(), mustGetPoolEndpoints(0, disk))
 	if err != nil {
-		t.Fatal("Unexpected err: ", err)
+		t.Fatal(err)
 	}
 
 	newTestConfig(globalMinioDefaultRegion, obj)
 
-	initAllSubsystems()
-
+	initAllSubsystems(GlobalContext)
 	return obj
 }
 
 // BenchmarkListObjects - Run ListObject Repeatedly and benchmark.
 func BenchmarkListObjects(b *testing.B) {
 	// Make a temporary directory to use as the obj.
-	directory, err := ioutil.TempDir(globalTestTmpDir, "minio-list-benchmark")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer os.RemoveAll(directory)
+	directory := b.TempDir()
 
 	// Create the obj.
 	obj := initFSObjectsB(directory, b)
 
 	bucket := "ls-benchmark-bucket"
 	// Create a bucket.
-	err = obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		b.Fatal(err)
 	}

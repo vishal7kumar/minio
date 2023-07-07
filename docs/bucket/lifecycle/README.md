@@ -4,8 +4,8 @@ Enable object lifecycle configuration on buckets to setup automatic deletion of 
 
 ## 1. Prerequisites
 
-- Install MinIO - [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide).
-- Install `mc` - [mc Quickstart Guide](https://docs.minio.io/docs/minio-client-quickstart-guide.html)
+- Install MinIO - [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#quickstart-for-linux).
+- Install `mc` - [mc Quickstart Guide](https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart)
 
 ## 2. Enable bucket lifecycle configuration
 
@@ -59,7 +59,7 @@ TempUploads |  temp/   |    ✓       |  ✓     |   7 day(s)   |     ✗       
 
 ## 3. Activate ILM versioning features
 
-This will only work with a versioned bucket, take a look at [Bucket Versioning Guide](https://docs.min.io/docs/minio-bucket-versioning-guide.html) for more understanding.
+This will only work with a versioned bucket, take a look at [Bucket Versioning Guide](https://min.io/docs/minio/linux/administration/object-management/object-versioning.html) for more understanding.
 
 ### 3.1 Automatic removal of non current objects versions
 
@@ -129,8 +129,30 @@ of objects under the prefix `user-uploads/` as soon as there are more than `N` n
     ]
 }
 ```
-
 Note: This rule has an implicit zero NoncurrentDays, which makes the expiry of those 'extra' noncurrent versions immediate.
+
+#### 3.2.b Automatic removal of all versions (MinIO only extension)
+
+This is available only on MinIO as an extension to the Expiration feature. The following rule makes it possible to remove all versions of an object under 
+the prefix `user-uploads/` as soon as the latest object satisfies the expiration criteria.
+
+```
+{
+    "Rules": [
+        {
+            "ID": "Purge all versions of an expired object",
+            "Status": "Enabled",
+            "Filter": {
+                "Prefix": "users-uploads/"
+            },
+            "Expiration": {
+                "Days": 7,
+                "ExpiredObjectAllVersions": true
+            }
+        }
+    ]
+}
+```
 
 ### 3.3 Automatic removal of delete markers with no other versions
 
@@ -192,5 +214,5 @@ Note that transition event notification is a MinIO extension.
 
 ## Explore Further
 
-- [MinIO | Golang Client API Reference](https://docs.min.io/docs/golang-client-api-reference.html#SetBucketLifecycle)
+- [MinIO | Golang Client API Reference](https://min.io/docs/minio/linux/developers/go/API.html)
 - [Object Lifecycle Management](https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lifecycle-mgmt.html)

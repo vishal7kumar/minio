@@ -27,19 +27,9 @@ import (
 )
 
 // writeSTSErrorRespone writes error headers
-func writeSTSErrorResponse(ctx context.Context, w http.ResponseWriter, isErrCodeSTS bool, errCode STSErrorCode, errCtxt error) {
-	var err STSError
-	if isErrCodeSTS {
-		err = stsErrCodes.ToSTSErr(errCode)
-	}
-	if err.Code == "InternalError" || !isErrCodeSTS {
-		aerr := getAPIError(APIErrorCode(errCode))
-		if aerr.Code != "InternalError" {
-			err.Code = aerr.Code
-			err.Description = aerr.Description
-			err.HTTPStatusCode = aerr.HTTPStatusCode
-		}
-	}
+func writeSTSErrorResponse(ctx context.Context, w http.ResponseWriter, errCode STSErrorCode, errCtxt error) {
+	err := stsErrCodes.ToSTSErr(errCode)
+
 	// Generate error response.
 	stsErrorResponse := STSErrorResponse{}
 	stsErrorResponse.Error.Code = err.Code
@@ -48,14 +38,10 @@ func writeSTSErrorResponse(ctx context.Context, w http.ResponseWriter, isErrCode
 	if errCtxt != nil {
 		stsErrorResponse.Error.Message = errCtxt.Error()
 	}
-	var logKind logger.Kind
 	switch errCode {
-	case ErrSTSInternalError, ErrSTSNotInitialized:
-		logKind = logger.Minio
-	default:
-		logKind = logger.All
+	case ErrSTSInternalError, ErrSTSNotInitialized, ErrSTSUpstreamError:
+		logger.LogIf(ctx, errCtxt, logger.Minio)
 	}
-	logger.LogIf(ctx, errCtxt, logKind)
 	encodedErrorResponse := encodeResponse(stsErrorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeXML)
 }
@@ -96,6 +82,7 @@ const (
 	ErrSTSInsecureConnection
 	ErrSTSInvalidClientCertificate
 	ErrSTSNotInitialized
+	ErrSTSUpstreamError
 	ErrSTSInternalError
 )
 
@@ -161,6 +148,11 @@ var stsErrCodes = stsErrorCodeMap{
 		Code:           "STSNotInitialized",
 		Description:    "STS API not initialized, please try again.",
 		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSTSUpstreamError: {
+		Code:           "InternalError",
+		Description:    "An upstream service required for this operation failed - please try again or contact an administrator.",
+		HTTPStatusCode: http.StatusInternalServerError,
 	},
 	ErrSTSInternalError: {
 		Code:           "InternalError",

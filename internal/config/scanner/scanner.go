@@ -18,6 +18,7 @@
 package scanner
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
@@ -27,10 +28,14 @@ import (
 
 // Compression environment variables
 const (
-	Delay   = "delay"
-	MaxWait = "max_wait"
-	Cycle   = "cycle"
+	Speed    = "speed"
+	EnvSpeed = "MINIO_SCANNER_SPEED"
 
+	// All below are deprecated in October 2022 and
+	// replaced them with a single speed parameter
+	Delay            = "delay"
+	MaxWait          = "max_wait"
+	Cycle            = "cycle"
 	EnvDelay         = "MINIO_SCANNER_DELAY"
 	EnvCycle         = "MINIO_SCANNER_CYCLE"
 	EnvDelayLegacy   = "MINIO_CRAWLER_DELAY"
@@ -48,51 +53,64 @@ type Config struct {
 	Cycle time.Duration
 }
 
-var (
-	// DefaultKVS - default KV config for heal settings
-	DefaultKVS = config.KVS{
-		config.KV{
-			Key:   Delay,
-			Value: "10",
-		},
-		config.KV{
-			Key:   MaxWait,
-			Value: "15s",
-		},
-		config.KV{
-			Key:   Cycle,
-			Value: "1m",
-		},
-	}
-
-	// Help provides help for config values
-	Help = config.HelpKVS{
-		config.HelpKV{
-			Key:         Delay,
-			Description: `scanner delay multiplier, defaults to '10.0'`,
-			Optional:    true,
-			Type:        "float",
-		},
-		config.HelpKV{
-			Key:         MaxWait,
-			Description: `maximum wait time between operations, defaults to '15s'`,
-			Optional:    true,
-			Type:        "duration",
-		},
-		config.HelpKV{
-			Key:         Cycle,
-			Description: `time duration between scanner cycles, defaults to '1m'`,
-			Optional:    true,
-			Type:        "duration",
-		},
-	}
-)
+// DefaultKVS - default KV config for heal settings
+var DefaultKVS = config.KVS{
+	config.KV{
+		Key:   Speed,
+		Value: "default",
+	},
+	// Deprecated Oct 2022
+	config.KV{
+		Key:        Delay,
+		Value:      "",
+		Deprecated: true,
+	},
+	// Deprecated Oct 2022
+	config.KV{
+		Key:        MaxWait,
+		Value:      "",
+		Deprecated: true,
+	},
+	// Deprecated Oct 2022
+	config.KV{
+		Key:        Cycle,
+		Value:      "",
+		Deprecated: true,
+	},
+}
 
 // LookupConfig - lookup config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	if err = config.CheckValidKeys(config.ScannerSubSys, kvs, DefaultKVS); err != nil {
 		return cfg, err
 	}
+
+	// Stick to loading deprecated config/env if they are already set, and the Speed value
+	// has not been changed from its "default" value, if it has been changed honor new settings.
+	if kvs.GetWithDefault(Speed, DefaultKVS) == "default" {
+		if kvs.Get(Delay) != "" && kvs.Get(MaxWait) != "" {
+			return lookupDeprecatedScannerConfig(kvs)
+		}
+	}
+
+	switch speed := env.Get(EnvSpeed, kvs.GetWithDefault(Speed, DefaultKVS)); speed {
+	case "fastest":
+		cfg.Delay, cfg.MaxWait, cfg.Cycle = 0, 0, time.Second
+	case "fast":
+		cfg.Delay, cfg.MaxWait, cfg.Cycle = 1, 100*time.Millisecond, time.Minute
+	case "default":
+		cfg.Delay, cfg.MaxWait, cfg.Cycle = 2, 5*time.Second, time.Minute
+	case "slow":
+		cfg.Delay, cfg.MaxWait, cfg.Cycle = 10, 15*time.Second, time.Minute
+	case "slowest":
+		cfg.Delay, cfg.MaxWait, cfg.Cycle = 100, 15*time.Second, 30*time.Minute
+	default:
+		return cfg, fmt.Errorf("unknown '%s' value", speed)
+	}
+	return
+}
+
+func lookupDeprecatedScannerConfig(kvs config.KVS) (cfg Config, err error) {
 	delay := env.Get(EnvDelayLegacy, "")
 	if delay == "" {
 		delay = env.Get(EnvDelay, kvs.GetWithDefault(Delay, DefaultKVS))
@@ -109,7 +127,6 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	if err != nil {
 		return cfg, err
 	}
-
 	cfg.Cycle, err = time.ParseDuration(env.Get(EnvCycle, kvs.GetWithDefault(Cycle, DefaultKVS)))
 	if err != nil {
 		return cfg, err

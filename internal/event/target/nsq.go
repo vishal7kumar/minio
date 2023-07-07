@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -29,6 +30,9 @@ import (
 	"github.com/nsqio/go-nsq"
 
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
+	"github.com/minio/minio/internal/store"
 	xnet "github.com/minio/pkg/net"
 )
 
@@ -87,12 +91,15 @@ func (n NSQArgs) Validate() error {
 
 // NSQTarget - NSQ target.
 type NSQTarget struct {
+	initOnce once.Init
+
 	id         event.TargetID
 	args       NSQArgs
 	producer   *nsq.Producer
-	store      Store
+	store      store.Store[event.Event]
 	config     *nsq.Config
-	loggerOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{})
+	loggerOnce logger.LogOnce
+	quitCh     chan struct{}
 }
 
 // ID - returns target ID.
@@ -100,13 +107,25 @@ func (target *NSQTarget) ID() event.TargetID {
 	return target.id
 }
 
-// HasQueueStore - Checks if the queueStore has been configured for the target
-func (target *NSQTarget) HasQueueStore() bool {
-	return target.store != nil
+// Name - returns the Name of the target.
+func (target *NSQTarget) Name() string {
+	return target.ID().String()
+}
+
+// Store returns any underlying store if set.
+func (target *NSQTarget) Store() event.TargetStore {
+	return target.store
 }
 
 // IsActive - Return true if target is up and active
 func (target *NSQTarget) IsActive() (bool, error) {
+	if err := target.init(); err != nil {
+		return false, err
+	}
+	return target.isActive()
+}
+
+func (target *NSQTarget) isActive() (bool, error) {
 	if target.producer == nil {
 		producer, err := nsq.NewProducer(target.args.NSQDAddress.String(), target.config)
 		if err != nil {
@@ -117,8 +136,8 @@ func (target *NSQTarget) IsActive() (bool, error) {
 
 	if err := target.producer.Ping(); err != nil {
 		// To treat "connection refused" errors as errNotConnected.
-		if IsConnRefusedErr(err) {
-			return false, errNotConnected
+		if xnet.IsConnRefusedErr(err) {
+			return false, store.ErrNotConnected
 		}
 		return false, err
 	}
@@ -130,7 +149,12 @@ func (target *NSQTarget) Save(eventData event.Event) error {
 	if target.store != nil {
 		return target.store.Put(eventData)
 	}
-	_, err := target.IsActive()
+
+	if err := target.init(); err != nil {
+		return err
+	}
+
+	_, err := target.isActive()
 	if err != nil {
 		return err
 	}
@@ -153,9 +177,13 @@ func (target *NSQTarget) send(eventData event.Event) error {
 	return target.producer.Publish(target.args.Topic, data)
 }
 
-// Send - reads an event from store and sends it to NSQ.
-func (target *NSQTarget) Send(eventKey string) error {
-	_, err := target.IsActive()
+// SendFromStore - reads an event from store and sends it to NSQ.
+func (target *NSQTarget) SendFromStore(eventKey string) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
+	_, err := target.isActive()
 	if err != nil {
 		return err
 	}
@@ -180,6 +208,7 @@ func (target *NSQTarget) Send(eventKey string) error {
 
 // Close - closes underneath connections to NSQD server.
 func (target *NSQTarget) Close() (err error) {
+	close(target.quitCh)
 	if target.producer != nil {
 		// this blocks until complete:
 		target.producer.Stop()
@@ -187,8 +216,13 @@ func (target *NSQTarget) Close() (err error) {
 	return nil
 }
 
-// NewNSQTarget - creates new NSQ target.
-func NewNSQTarget(id string, args NSQArgs, doneCh <-chan struct{}, loggerOnce func(ctx context.Context, err error, id interface{}, kind ...interface{}), test bool) (*NSQTarget, error) {
+func (target *NSQTarget) init() error {
+	return target.initOnce.Do(target.initNSQ)
+}
+
+func (target *NSQTarget) initNSQ() error {
+	args := target.args
+
 	config := nsq.NewConfig()
 	if args.TLS.Enable {
 		config.TlsV1 = true
@@ -196,46 +230,57 @@ func NewNSQTarget(id string, args NSQArgs, doneCh <-chan struct{}, loggerOnce fu
 			InsecureSkipVerify: args.TLS.SkipVerify,
 		}
 	}
+	target.config = config
 
-	var store Store
+	producer, err := nsq.NewProducer(args.NSQDAddress.String(), config)
+	if err != nil {
+		target.loggerOnce(context.Background(), err, target.ID().String())
+		return err
+	}
+	target.producer = producer
+
+	err = target.producer.Ping()
+	if err != nil {
+		// To treat "connection refused" errors as errNotConnected.
+		if !(xnet.IsConnRefusedErr(err) || xnet.IsConnResetErr(err)) {
+			target.loggerOnce(context.Background(), err, target.ID().String())
+		}
+		target.producer.Stop()
+		return err
+	}
+
+	yes, err := target.isActive()
+	if err != nil {
+		return err
+	}
+	if !yes {
+		return store.ErrNotConnected
+	}
+
+	return nil
+}
+
+// NewNSQTarget - creates new NSQ target.
+func NewNSQTarget(id string, args NSQArgs, loggerOnce logger.LogOnce) (*NSQTarget, error) {
+	var queueStore store.Store[event.Event]
+	if args.QueueDir != "" {
+		queueDir := filepath.Join(args.QueueDir, storePrefix+"-nsq-"+id)
+		queueStore = store.NewQueueStore[event.Event](queueDir, args.QueueLimit, event.StoreExtension)
+		if err := queueStore.Open(); err != nil {
+			return nil, fmt.Errorf("unable to initialize the queue store of NSQ `%s`: %w", id, err)
+		}
+	}
 
 	target := &NSQTarget{
 		id:         event.TargetID{ID: id, Name: "nsq"},
 		args:       args,
-		config:     config,
 		loggerOnce: loggerOnce,
+		store:      queueStore,
+		quitCh:     make(chan struct{}),
 	}
 
-	if args.QueueDir != "" {
-		queueDir := filepath.Join(args.QueueDir, storePrefix+"-nsq-"+id)
-		store = NewQueueStore(queueDir, args.QueueLimit)
-		if oErr := store.Open(); oErr != nil {
-			target.loggerOnce(context.Background(), oErr, target.ID())
-			return target, oErr
-		}
-		target.store = store
-	}
-
-	producer, err := nsq.NewProducer(args.NSQDAddress.String(), config)
-	if err != nil {
-		target.loggerOnce(context.Background(), err, target.ID())
-		return target, err
-	}
-	target.producer = producer
-
-	if err := target.producer.Ping(); err != nil {
-		// To treat "connection refused" errors as errNotConnected.
-		if target.store == nil || !(IsConnRefusedErr(err) || IsConnResetErr(err)) {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
-		}
-	}
-
-	if target.store != nil && !test {
-		// Replays the events from the store.
-		eventKeyCh := replayEvents(target.store, doneCh, target.loggerOnce, target.ID())
-		// Start replaying events from the store.
-		go sendEvents(target, eventKeyCh, doneCh, target.loggerOnce)
+	if target.store != nil {
+		store.StreamItems(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil

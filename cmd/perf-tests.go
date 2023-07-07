@@ -22,64 +22,97 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
+	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/google/uuid"
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/hash"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/pkg/randreader"
 )
 
-// SpeedtestResult return value of the speedtest function
-type SpeedtestResult struct {
-	Endpoint  string
-	Uploads   uint64
-	Downloads uint64
-	Error     string
+// SpeedTestResult return value of the speedtest function
+type SpeedTestResult struct {
+	Endpoint      string
+	Uploads       uint64
+	Downloads     uint64
+	UploadTimes   madmin.TimeDurations
+	DownloadTimes madmin.TimeDurations
+	DownloadTTFB  madmin.TimeDurations
+	Error         string
 }
 
 func newRandomReader(size int) io.Reader {
 	return io.LimitReader(randreader.New(), int64(size))
 }
 
+type firstByteRecorder struct {
+	t *time.Time
+	r io.Reader
+}
+
+func (f *firstByteRecorder) Read(p []byte) (n int, err error) {
+	if f.t != nil || len(p) == 0 {
+		return f.r.Read(p)
+	}
+	// Read a single byte.
+	n, err = f.r.Read(p[:1])
+	if n > 0 {
+		t := time.Now()
+		f.t = &t
+	}
+	return n, err
+}
+
 // Runs the speedtest on local MinIO process.
-func selfSpeedtest(ctx context.Context, size, concurrent int, duration time.Duration, storageClass string) (SpeedtestResult, error) {
+func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, error) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		return SpeedtestResult{}, errServerNotInitialized
+		return SpeedTestResult{}, errServerNotInitialized
 	}
 
+	var wg sync.WaitGroup
 	var errOnce sync.Once
 	var retError string
-	var wg sync.WaitGroup
 	var totalBytesWritten uint64
 	var totalBytesRead uint64
 
-	objCountPerThread := make([]uint64, concurrent)
+	objCountPerThread := make([]uint64, opts.concurrency)
 
 	uploadsCtx, uploadsCancel := context.WithCancel(context.Background())
 	defer uploadsCancel()
 
 	go func() {
-		time.Sleep(duration)
+		time.Sleep(opts.duration)
 		uploadsCancel()
 	}()
 
-	objNamePrefix := "speedtest/objects/" + uuid.New().String()
+	objNamePrefix := pathJoin(speedTest, mustGetUUID())
 
-	wg.Add(concurrent)
-	for i := 0; i < concurrent; i++ {
+	userMetadata := make(map[string]string)
+	userMetadata[globalObjectPerfUserMetadata] = "true" // Bypass S3 API freeze
+	popts := minio.PutObjectOptions{
+		UserMetadata:         userMetadata,
+		DisableContentSha256: true,
+		DisableMultipart:     true,
+	}
+
+	var mu sync.Mutex
+	var uploadTimes madmin.TimeDurations
+	wg.Add(opts.concurrency)
+	for i := 0; i < opts.concurrency; i++ {
 		go func(i int) {
 			defer wg.Done()
 			for {
-				hashReader, err := hash.NewReader(newRandomReader(size),
-					int64(size), "", "", int64(size))
+				t := time.Now()
+				reader := newRandomReader(opts.objectSize)
+				tmpObjName := pathJoin(objNamePrefix, fmt.Sprintf("%d/%d", i, objCountPerThread[i]))
+				info, err := globalMinioClient.PutObject(uploadsCtx, opts.bucketName, tmpObjName, reader, int64(opts.objectSize), popts)
 				if err != nil {
 					if !contextCanceled(uploadsCtx) && !errors.Is(err, context.Canceled) {
 						errOnce.Do(func() {
@@ -89,26 +122,12 @@ func selfSpeedtest(ctx context.Context, size, concurrent int, duration time.Dura
 					uploadsCancel()
 					return
 				}
-				reader := NewPutObjReader(hashReader)
-				objInfo, err := objAPI.PutObject(uploadsCtx, minioMetaBucket, fmt.Sprintf("%s.%d.%d",
-					objNamePrefix, i, objCountPerThread[i]), reader, ObjectOptions{
-					UserDefined: map[string]string{
-						xhttp.AmzStorageClass: storageClass,
-					},
-					Speedtest: true,
-				})
-				if err != nil {
-					objCountPerThread[i]--
-					if !contextCanceled(uploadsCtx) && !errors.Is(err, context.Canceled) {
-						errOnce.Do(func() {
-							retError = err.Error()
-						})
-					}
-					uploadsCancel()
-					return
-				}
-				atomic.AddUint64(&totalBytesWritten, uint64(objInfo.Size))
+				response := time.Since(t)
+				atomic.AddUint64(&totalBytesWritten, uint64(info.Size))
 				objCountPerThread[i]++
+				mu.Lock()
+				uploadTimes = append(uploadTimes, response)
+				mu.Unlock()
 			}
 		}(i)
 	}
@@ -116,18 +135,28 @@ func selfSpeedtest(ctx context.Context, size, concurrent int, duration time.Dura
 
 	// We already saw write failures, no need to proceed into read's
 	if retError != "" {
-		return SpeedtestResult{Uploads: totalBytesWritten, Downloads: totalBytesRead, Error: retError}, nil
+		return SpeedTestResult{
+			Uploads:     totalBytesWritten,
+			Downloads:   totalBytesRead,
+			UploadTimes: uploadTimes,
+			Error:       retError,
+		}, nil
 	}
 
 	downloadsCtx, downloadsCancel := context.WithCancel(context.Background())
 	defer downloadsCancel()
 	go func() {
-		time.Sleep(duration)
+		time.Sleep(opts.duration)
 		downloadsCancel()
 	}()
 
-	wg.Add(concurrent)
-	for i := 0; i < concurrent; i++ {
+	gopts := minio.GetObjectOptions{}
+	gopts.Set(globalObjectPerfUserMetadata, "true") // Bypass S3 API freeze
+
+	var downloadTimes madmin.TimeDurations
+	var downloadTTFB madmin.TimeDurations
+	wg.Add(opts.concurrency)
+	for i := 0; i < opts.concurrency; i++ {
 		go func(i int) {
 			defer wg.Done()
 			var j uint64
@@ -138,10 +167,12 @@ func selfSpeedtest(ctx context.Context, size, concurrent int, duration time.Dura
 				if objCountPerThread[i] == j {
 					j = 0
 				}
-				r, err := objAPI.GetObjectNInfo(downloadsCtx, minioMetaBucket, fmt.Sprintf("%s.%d.%d",
-					objNamePrefix, i, j), nil, nil, noLock, ObjectOptions{})
+				tmpObjName := pathJoin(objNamePrefix, fmt.Sprintf("%d/%d", i, j))
+				t := time.Now()
+				r, err := globalMinioClient.GetObject(downloadsCtx, opts.bucketName, tmpObjName, gopts)
 				if err != nil {
-					if isErrObjectNotFound(err) {
+					errResp, ok := err.(minio.ErrorResponse)
+					if ok && errResp.StatusCode == http.StatusNotFound {
 						continue
 					}
 					if !contextCanceled(downloadsCtx) && !errors.Is(err, context.Canceled) {
@@ -152,13 +183,22 @@ func selfSpeedtest(ctx context.Context, size, concurrent int, duration time.Dura
 					downloadsCancel()
 					return
 				}
-				n, err := io.Copy(ioutil.Discard, r)
+				fbr := firstByteRecorder{
+					r: r,
+				}
+				n, err := io.Copy(io.Discard, &fbr)
 				r.Close()
 				if err == nil {
+					response := time.Since(t)
+					ttfb := time.Since(*fbr.t)
 					// Only capture success criteria - do not
 					// have to capture failed reads, truncated
 					// reads etc.
 					atomic.AddUint64(&totalBytesRead, uint64(n))
+					mu.Lock()
+					downloadTimes = append(downloadTimes, response)
+					downloadTTFB = append(downloadTTFB, ttfb)
+					mu.Unlock()
 				}
 				if err != nil {
 					if !contextCanceled(downloadsCtx) && !errors.Is(err, context.Canceled) {
@@ -175,7 +215,14 @@ func selfSpeedtest(ctx context.Context, size, concurrent int, duration time.Dura
 	}
 	wg.Wait()
 
-	return SpeedtestResult{Uploads: totalBytesWritten, Downloads: totalBytesRead, Error: retError}, nil
+	return SpeedTestResult{
+		Uploads:       totalBytesWritten,
+		Downloads:     totalBytesRead,
+		UploadTimes:   uploadTimes,
+		DownloadTimes: downloadTimes,
+		DownloadTTFB:  downloadTTFB,
+		Error:         retError,
+	}, nil
 }
 
 // To collect RX stats during "mc support perf net"
@@ -195,7 +242,7 @@ func (n *netPerfRX) Connect() {
 	n.Lock()
 	defer n.Unlock()
 	n.activeConnections++
-	atomic.StoreUint64(&globalNetPerfRX.RX, 0)
+	atomic.StoreUint64(&n.RX, 0)
 	n.lastToConnect = time.Now()
 }
 
@@ -216,8 +263,8 @@ func (n *netPerfRX) ActiveConnections() uint64 {
 }
 
 func (n *netPerfRX) Reset() {
-	n.RLock()
-	defer n.RUnlock()
+	n.Lock()
+	defer n.Unlock()
 	n.RX = 0
 	n.RXSample = 0
 	n.lastToConnect = time.Time{}
@@ -292,4 +339,86 @@ func netperf(ctx context.Context, duration time.Duration) madmin.NetperfNodeResu
 
 	globalNetPerfRX.Reset()
 	return madmin.NetperfNodeResult{Endpoint: "", TX: r.n / uint64(duration.Seconds()), RX: uint64(rx / delta.Seconds()), Error: errStr}
+}
+
+func siteNetperf(ctx context.Context, duration time.Duration) madmin.SiteNetPerfNodeResult {
+	r := &netperfReader{eof: make(chan struct{})}
+	r.buf = make([]byte, 128*humanize.KiByte)
+	rand.Read(r.buf)
+
+	clusterInfos, err := globalSiteReplicationSys.GetClusterInfo(ctx)
+	if err != nil {
+		return madmin.SiteNetPerfNodeResult{Error: err.Error()}
+	}
+
+	// Scale the number of connections from 32 -> 4 from small to large clusters.
+	connectionsPerPeer := 3 + (29+len(clusterInfos.Sites)-1)/len(clusterInfos.Sites)
+
+	errStr := ""
+	var wg sync.WaitGroup
+
+	for _, info := range clusterInfos.Sites {
+		// skip self
+		if globalDeploymentID == info.DeploymentID {
+			continue
+		}
+		info := info
+		wg.Add(connectionsPerPeer)
+		for i := 0; i < connectionsPerPeer; i++ {
+			go func() {
+				defer wg.Done()
+				cli, err := globalSiteReplicationSys.getAdminClient(ctx, info.DeploymentID)
+				if err != nil {
+					return
+				}
+				rp := cli.GetEndpointURL()
+				reqURL := &url.URL{
+					Scheme: rp.Scheme,
+					Host:   rp.Host,
+					Path:   adminPathPrefix + adminAPIVersionPrefix + adminAPISiteReplicationDevNull,
+				}
+				req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL.String(), r)
+				if err != nil {
+					return
+				}
+				client := &http.Client{
+					Timeout:   duration + 10*time.Second,
+					Transport: globalRemoteTargetTransport,
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					return
+				}
+				defer xhttp.DrainBody(resp.Body)
+			}()
+		}
+	}
+
+	time.Sleep(duration)
+	close(r.eof)
+	wg.Wait()
+	for {
+		if globalSiteNetPerfRX.ActiveConnections() == 0 || contextCanceled(ctx) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	rx := float64(globalSiteNetPerfRX.RXSample)
+	delta := globalSiteNetPerfRX.firstToDisconnect.Sub(globalSiteNetPerfRX.lastToConnect)
+	// If the first disconnected before the last connected, we likely had a network issue.
+	if delta <= 0 {
+		rx = 0
+		errStr = "detected network disconnections, possibly an unstable network"
+	}
+
+	globalSiteNetPerfRX.Reset()
+	return madmin.SiteNetPerfNodeResult{
+		Endpoint:        "",
+		TX:              r.n,
+		TXTotalDuration: duration,
+		RX:              uint64(rx),
+		RXTotalDuration: delta,
+		Error:           errStr,
+		TotalConn:       uint64(connectionsPerPeer),
+	}
 }

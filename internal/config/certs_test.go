@@ -18,7 +18,6 @@
 package config
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 )
@@ -26,7 +25,7 @@ import (
 func createTempFile(prefix, content string) (tempFile string, err error) {
 	var tmpfile *os.File
 
-	if tmpfile, err = ioutil.TempFile("", prefix); err != nil {
+	if tmpfile, err = os.CreateTemp("", prefix); err != nil {
 		return tempFile, err
 	}
 
@@ -181,6 +180,9 @@ M9ofSEt/bdRD
 }
 
 func TestLoadX509KeyPair(t *testing.T) {
+	t.Cleanup(func() {
+		os.Unsetenv(EnvCertPassword)
+	})
 	for i, testCase := range loadX509KeyPairTests {
 		privateKey, err := createTempFile("private.key", testCase.privateKey)
 		if err != nil {
@@ -192,9 +194,8 @@ func TestLoadX509KeyPair(t *testing.T) {
 			t.Fatalf("Test %d: failed to create tmp certificate file: %v", i, err)
 		}
 
-		os.Unsetenv(EnvCertPassword)
 		if testCase.password != "" {
-			os.Setenv(EnvCertPassword, testCase.password)
+			t.Setenv(EnvCertPassword, testCase.password)
 		}
 		_, err = LoadX509KeyPair(certificate, privateKey)
 		if err != nil && !testCase.shouldFail {

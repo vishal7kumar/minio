@@ -38,13 +38,13 @@ func TestParseAndValidateReplicationConfig(t *testing.T) {
 			expectedParsingErr:    nil,
 			expectedValidationErr: errInvalidDeleteMarkerReplicationStatus,
 		},
-		// 2 Invalid delete replication status in replication config
+		// 2 No delete replication status in replication config
 		{
 			inputConfig:           `<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Role>arn:aws:iam::AcctID:role/role-name</Role><Rule><Status>Enabled</Status><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Prefix>key-prefix</Prefix><Destination><Bucket>arn:aws:s3:::destinationbucket</Bucket></Destination></Rule></ReplicationConfiguration>`,
 			destBucket:            "destinationbucket",
 			sameTarget:            false,
 			expectedParsingErr:    nil,
-			expectedValidationErr: errDeleteReplicationMissing,
+			expectedValidationErr: nil,
 		},
 		// 3 valid replication config
 		{
@@ -295,12 +295,14 @@ func TestReplicate(t *testing.T) {
 		{ObjectOpts{Name: "xa/c5test", UserTags: "k1=v1", Replica: false}, cfgs[4], true}, // 40. replica syncing disabled, this object is NOT a replica
 	}
 
-	for i, testCase := range testCases {
-		result := testCase.c.Replicate(testCase.opts)
-
-		if result != testCase.expectedResult {
-			t.Fatalf("case %v: expected: %v, got: %v", i+1, testCase.expectedResult, result)
-		}
+	for _, testCase := range testCases {
+		testCase := testCase
+		t.Run(testCase.opts.Name, func(t *testing.T) {
+			result := testCase.c.Replicate(testCase.opts)
+			if result != testCase.expectedResult {
+				t.Errorf("expected: %v, got: %v", testCase.expectedResult, result)
+			}
+		})
 	}
 }
 

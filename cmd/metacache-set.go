@@ -33,6 +33,8 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/object/lock"
+	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
@@ -48,6 +50,7 @@ type listPathOptions struct {
 	Bucket string
 
 	// Directory inside the bucket.
+	// When unset listPath will set this based on Prefix
 	BaseDir string
 
 	// Scan/return only content with prefix.
@@ -93,17 +96,47 @@ type listPathOptions struct {
 	// Versioned is this a ListObjectVersions call.
 	Versioned bool
 
-	// pool and set of where the cache is located.
-	pool, set int
+	// Versioning config is used for if the path
+	// has versioning enabled.
+	Versioning *versioning.Versioning
 
-	// lcFilter performs filtering based on lifecycle.
+	// Lifecycle performs filtering based on lifecycle.
 	// This will filter out objects if the most recent version should be deleted by lifecycle.
 	// Is not transferred across request calls.
-	lcFilter *lifecycle.Lifecycle
+	Lifecycle *lifecycle.Lifecycle
+
+	// Retention configuration, needed to be passed along with lifecycle if set.
+	Retention lock.Retention
+
+	// Replication configuration
+	Replication replicationConfig
+
+	// StopDiskAtLimit will stop listing on each disk when limit number off objects has been returned.
+	StopDiskAtLimit bool
+
+	// pool and set of where the cache is located.
+	pool, set int
 }
 
 func init() {
 	gob.Register(listPathOptions{})
+}
+
+func (o *listPathOptions) setBucketMeta(ctx context.Context) {
+	lc, _ := globalLifecycleSys.Get(o.Bucket)
+	vc, _ := globalBucketVersioningSys.Get(o.Bucket)
+
+	// Check if bucket is object locked.
+	rcfg, _ := globalBucketObjectLockSys.Get(o.Bucket)
+	replCfg, _, _ := globalBucketMetadataSys.GetReplicationConfig(ctx, o.Bucket)
+	tgts, _ := globalBucketTargetSys.ListBucketTargets(ctx, o.Bucket)
+	o.Lifecycle = lc
+	o.Versioning = vc
+	o.Replication = replicationConfig{
+		Config:  replCfg,
+		remotes: tgts,
+	}
+	o.Retention = rcfg
 }
 
 // newMetacache constructs a new metacache from the options.
@@ -342,12 +375,15 @@ func (r *metacacheReader) filter(o listPathOptions) (entries metaCacheEntriesSor
 				return true
 			}
 			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
-				return entries.len() < o.Limit
+				return true
+			}
+			if entry.isAllFreeVersions() {
+				return true
 			}
 			entries.o = append(entries.o, entry)
 			return entries.len() < o.Limit
 		})
-		if (err != nil && err.Error() == io.EOF.Error()) || pastPrefix || r.nextEOF() {
+		if (err != nil && errors.Is(err, io.EOF)) || pastPrefix || r.nextEOF() {
 			return entries, io.EOF
 		}
 		return entries, err
@@ -360,6 +396,11 @@ func (r *metacacheReader) filter(o listPathOptions) (entries metaCacheEntriesSor
 func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOptions) (entries metaCacheEntriesSorted, err error) {
 	retries := 0
 	rpc := globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix))
+
+	const (
+		retryDelay    = 50 * time.Millisecond
+		retryDelay250 = 250 * time.Millisecond
+	)
 
 	for {
 		if contextCanceled(ctx) {
@@ -375,7 +416,6 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			retries = 1
 		}
 
-		const retryDelay = 250 * time.Millisecond
 		// All operations are performed without locks, so we must be careful and allow for failures.
 		// Read metadata associated with the object from a disk.
 		if retries > 0 {
@@ -389,7 +429,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 				_, err := disk.ReadVersion(ctx, minioMetaBucket,
 					o.objectPath(0), "", false)
 				if err != nil {
-					time.Sleep(retryDelay)
+					time.Sleep(retryDelay250)
 					retries++
 					continue
 				}
@@ -404,11 +444,19 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			switch toObjectErr(err, minioMetaBucket, o.objectPath(0)).(type) {
 			case ObjectNotFound:
 				retries++
-				time.Sleep(retryDelay)
+				if retries == 1 {
+					time.Sleep(retryDelay)
+				} else {
+					time.Sleep(retryDelay250)
+				}
 				continue
 			case InsufficientReadQuorum:
 				retries++
-				time.Sleep(retryDelay)
+				if retries == 1 {
+					time.Sleep(retryDelay)
+				} else {
+					time.Sleep(retryDelay250)
+				}
 				continue
 			default:
 				return entries, fmt.Errorf("reading first part metadata: %w", err)
@@ -427,7 +475,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 				retries = -1
 			}
 			retries++
-			time.Sleep(retryDelay)
+			time.Sleep(retryDelay250)
 			continue
 		case errors.Is(err, io.EOF):
 			return entries, io.EOF
@@ -461,7 +509,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 						_, err := disk.ReadVersion(ctx, minioMetaBucket,
 							o.objectPath(partN), "", false)
 						if err != nil {
-							time.Sleep(retryDelay)
+							time.Sleep(retryDelay250)
 							retries++
 							continue
 						}
@@ -472,7 +520,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 				// Load partN metadata...
 				fi, metaArr, onlineDisks, err = er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(partN), ObjectOptions{}, true)
 				if err != nil {
-					time.Sleep(retryDelay)
+					time.Sleep(retryDelay250)
 					retries++
 					continue
 				}
@@ -496,6 +544,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			tmp := newMetacacheReader(pr)
 			e, err := tmp.filter(o)
 			pr.CloseWithError(err)
+			tmp.Close()
 			entries.o = append(entries.o, e.o...)
 			if o.Limit > 0 && entries.len() > o.Limit {
 				entries.truncate(o.Limit)
@@ -505,15 +554,15 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 				// We stopped within the listing, we are done for now...
 				return entries, nil
 			}
-			if err != nil && err.Error() != io.EOF.Error() {
+			if err != nil && !errors.Is(err, io.EOF) {
 				switch toObjectErr(err, minioMetaBucket, o.objectPath(partN)).(type) {
 				case ObjectNotFound:
 					retries++
-					time.Sleep(retryDelay)
+					time.Sleep(retryDelay250)
 					continue
 				case InsufficientReadQuorum:
 					retries++
-					time.Sleep(retryDelay)
+					time.Sleep(retryDelay250)
 					continue
 				default:
 					logger.LogIf(ctx, err)
@@ -549,7 +598,7 @@ func getListQuorum(quorum string, driveCount int) int {
 	case "reduced":
 		return 2
 	case "strict":
-		return -1
+		return driveCount
 	}
 	// Defaults to (driveCount+1)/2 drives per set, defaults to "optimal" value
 	if driveCount > 0 {
@@ -563,16 +612,19 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 	defer close(results)
 	o.debugf(color.Green("listPath:")+" with options: %#v", o)
 
+	// get non-healing disks for listing
+	disks, _ := er.getOnlineDisksWithHealing()
 	askDisks := getListQuorum(o.AskDisks, er.setDriveCount)
-	listingQuorum := askDisks - 1
-	disks := er.getDisks()
 	var fallbackDisks []StorageAPI
 
 	// Special case: ask all disks if the drive count is 4
-	if askDisks <= 0 || er.setDriveCount == 4 {
-		askDisks = len(disks)                // with 'strict' quorum list on all drives.
-		listingQuorum = (len(disks) + 1) / 2 // keep this such that we can list all objects with different quorum ratio.
+	if er.setDriveCount == 4 || askDisks > len(disks) {
+		askDisks = len(disks) // use all available drives
 	}
+
+	// However many we ask, versions must exist on ~50%
+	listingQuorum := (askDisks + 1) / 2
+
 	if askDisks > 0 && len(disks) > askDisks {
 		rand.Shuffle(len(disks), func(i, j int) {
 			disks[i], disks[j] = disks[j], disks[i]
@@ -594,7 +646,12 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 	if !o.Versioned {
 		resolver.requestedVersions = 1
 	}
-
+	var limit int
+	if o.Limit > 0 && o.StopDiskAtLimit {
+		// Over-read by 4 + 1 for every 16 in limit to give some space for resolver,
+		// allow for truncating the list and know if we have more results.
+		limit = o.Limit + 4 + (o.Limit / 16)
+	}
 	ctxDone := ctx.Done()
 	return listPathRaw(ctx, listPathRawOptions{
 		disks:         disks,
@@ -605,13 +662,14 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 		filterPrefix:  o.FilterPrefix,
 		minDisks:      listingQuorum,
 		forwardTo:     o.Marker,
+		perDiskLimit:  limit,
 		agreed: func(entry metaCacheEntry) {
 			select {
 			case <-ctxDone:
 			case results <- entry:
 			}
 		},
-		partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
+		partial: func(entries metaCacheEntries, errs []error) {
 			// Results Disagree :-(
 			entry, ok := entries.resolve(&resolver)
 			if ok {
@@ -791,6 +849,10 @@ type listPathRawOptions struct {
 	minDisks       int
 	reportNotFound bool
 
+	// perDiskLimit will limit each disk to return n objects.
+	// If <= 0 all results will be returned until canceled.
+	perDiskLimit int
+
 	// Callbacks with results:
 	// If set to nil, it will not be called.
 
@@ -800,7 +862,7 @@ type listPathRawOptions struct {
 	// partial will be called when there is disagreement between disks.
 	// if disk did not return any result, but also haven't errored
 	// the entry will be empty and errs will
-	partial func(entries metaCacheEntries, nAgreed int, errs []error)
+	partial func(entries metaCacheEntries, errs []error)
 
 	// finished will be called when all streams have finished and
 	// more than one disk returned an error.
@@ -827,8 +889,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 	var fdMu sync.Mutex
 	fds := opts.fallbackDisks
 	fallback := func(err error) StorageAPI {
-		switch err.(type) {
-		case StorageErr:
+		if _, ok := err.(StorageErr); ok {
 			// Attempt to grab a fallback disk
 			fdMu.Lock()
 			defer fdMu.Unlock()
@@ -850,6 +911,11 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 	}
 	askDisks := len(disks)
 	readers := make([]*metacacheReader, askDisks)
+	defer func() {
+		for _, r := range readers {
+			r.Close()
+		}
+	}()
 	for i := range disks {
 		r, w := io.Pipe()
 		// Make sure we close the pipe so blocked writes doesn't stay around.
@@ -865,6 +931,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				werr = errDiskNotFound
 			} else {
 				werr = d.WalkDir(ctx, WalkDirOptions{
+					Limit:          opts.perDiskLimit,
 					Bucket:         opts.bucket,
 					BaseDir:        opts.path,
 					Recursive:      opts.recursive,
@@ -875,11 +942,16 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			}
 
 			// fallback only when set.
-			for fd := fallback(werr); fd != nil; {
+			for {
+				fd := fallback(werr)
+				if fd == nil {
+					break
+				}
 				// This fallback is only set when
 				// askDisks is less than total
 				// number of disks per set.
 				werr = fd.WalkDir(ctx, WalkDirOptions{
+					Limit:          opts.perDiskLimit,
 					Bucket:         opts.bucket,
 					BaseDir:        opts.path,
 					Recursive:      opts.recursive,
@@ -892,15 +964,6 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				}
 			}
 			w.CloseWithError(werr)
-
-			if werr != io.EOF && werr != nil &&
-				werr.Error() != errFileNotFound.Error() &&
-				werr.Error() != errVolumeNotFound.Error() &&
-				werr.Error() != errDiskNotFound.Error() &&
-				werr.Error() != errUnformattedDisk.Error() &&
-				!errors.Is(werr, context.Canceled) {
-				logger.LogIf(ctx, werr)
-			}
 		}()
 	}
 
@@ -983,7 +1046,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				if err != nil {
 					if disks[i] != nil {
 						combinedErr = append(combinedErr,
-							fmt.Sprintf("disk %s returned: %s", disks[i], err))
+							fmt.Sprintf("drive %s returned: %s", disks[i], err))
 					} else {
 						combinedErr = append(combinedErr, err.Error())
 					}
@@ -1013,7 +1076,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			continue
 		}
 		if opts.partial != nil {
-			opts.partial(topEntries, agree, errs)
+			opts.partial(topEntries, errs)
 		}
 		// Skip the inputs we used.
 		for i, r := range readers {

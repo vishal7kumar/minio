@@ -20,15 +20,19 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go"
-
+	"github.com/dustin/go-humanize"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/mux"
 	"github.com/minio/pkg/bucket/policy"
 	iampolicy "github.com/minio/pkg/iam/policy"
 )
@@ -113,20 +117,27 @@ func (a adminAPIHandlers) SRPeerBucketOps(w http.ResponseWriter, r *http.Request
 	default:
 		err = errSRInvalidRequest(errInvalidArgument)
 	case madmin.MakeWithVersioningBktOp:
-		_, isLockEnabled := r.Form["lockEnabled"]
-		_, isVersioningEnabled := r.Form["versioningEnabled"]
-		opts := BucketOptions{
-			Location:          r.Form.Get("location"),
-			LockEnabled:       isLockEnabled,
-			VersioningEnabled: isVersioningEnabled,
+		createdAt, cerr := time.Parse(time.RFC3339Nano, strings.TrimSpace(r.Form.Get("createdAt")))
+		if cerr != nil {
+			createdAt = timeSentinel
+		}
+
+		opts := MakeBucketOptions{
+			LockEnabled:       r.Form.Get("lockEnabled") == "true",
+			VersioningEnabled: r.Form.Get("versioningEnabled") == "true",
+			ForceCreate:       r.Form.Get("forceCreate") == "true",
+			CreatedAt:         createdAt,
 		}
 		err = globalSiteReplicationSys.PeerBucketMakeWithVersioningHandler(ctx, bucket, opts)
 	case madmin.ConfigureReplBktOp:
 		err = globalSiteReplicationSys.PeerBucketConfigureReplHandler(ctx, bucket)
-	case madmin.DeleteBucketBktOp:
-		err = globalSiteReplicationSys.PeerBucketDeleteHandler(ctx, bucket, false)
-	case madmin.ForceDeleteBucketBktOp:
-		err = globalSiteReplicationSys.PeerBucketDeleteHandler(ctx, bucket, true)
+	case madmin.DeleteBucketBktOp, madmin.ForceDeleteBucketBktOp:
+		err = globalSiteReplicationSys.PeerBucketDeleteHandler(ctx, bucket, DeleteBucketOptions{
+			Force:      operation == madmin.ForceDeleteBucketBktOp,
+			SRDeleteOp: getSRBucketDeleteOp(true),
+		})
+	case madmin.PurgeDeletedBucketOp:
+		globalSiteReplicationSys.purgeDeletedBucket(ctx, objectAPI, bucket)
 	}
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -158,7 +169,7 @@ func (a adminAPIHandlers) SRPeerReplicateIAMItem(w http.ResponseWriter, r *http.
 		err = errSRInvalidRequest(errInvalidArgument)
 	case madmin.SRIAMItemPolicy:
 		if item.Policy == nil {
-			err = globalSiteReplicationSys.PeerAddPolicyHandler(ctx, item.Name, nil)
+			err = globalSiteReplicationSys.PeerAddPolicyHandler(ctx, item.Name, nil, item.UpdatedAt)
 		} else {
 			policy, perr := iampolicy.ParseConfig(bytes.NewReader(item.Policy))
 			if perr != nil {
@@ -166,21 +177,21 @@ func (a adminAPIHandlers) SRPeerReplicateIAMItem(w http.ResponseWriter, r *http.
 				return
 			}
 			if policy.IsEmpty() {
-				err = globalSiteReplicationSys.PeerAddPolicyHandler(ctx, item.Name, nil)
+				err = globalSiteReplicationSys.PeerAddPolicyHandler(ctx, item.Name, nil, item.UpdatedAt)
 			} else {
-				err = globalSiteReplicationSys.PeerAddPolicyHandler(ctx, item.Name, policy)
+				err = globalSiteReplicationSys.PeerAddPolicyHandler(ctx, item.Name, policy, item.UpdatedAt)
 			}
 		}
 	case madmin.SRIAMItemSvcAcc:
-		err = globalSiteReplicationSys.PeerSvcAccChangeHandler(ctx, item.SvcAccChange)
+		err = globalSiteReplicationSys.PeerSvcAccChangeHandler(ctx, item.SvcAccChange, item.UpdatedAt)
 	case madmin.SRIAMItemPolicyMapping:
-		err = globalSiteReplicationSys.PeerPolicyMappingHandler(ctx, item.PolicyMapping)
+		err = globalSiteReplicationSys.PeerPolicyMappingHandler(ctx, item.PolicyMapping, item.UpdatedAt)
 	case madmin.SRIAMItemSTSAcc:
-		err = globalSiteReplicationSys.PeerSTSAccHandler(ctx, item.STSCredential)
+		err = globalSiteReplicationSys.PeerSTSAccHandler(ctx, item.STSCredential, item.UpdatedAt)
 	case madmin.SRIAMItemIAMUser:
-		err = globalSiteReplicationSys.PeerIAMUserChangeHandler(ctx, item.IAMUser)
+		err = globalSiteReplicationSys.PeerIAMUserChangeHandler(ctx, item.IAMUser, item.UpdatedAt)
 	case madmin.SRIAMItemGroupInfo:
-		err = globalSiteReplicationSys.PeerGroupInfoChangeHandler(ctx, item.GroupInfo)
+		err = globalSiteReplicationSys.PeerGroupInfoChangeHandler(ctx, item.GroupInfo, item.UpdatedAt)
 	}
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -212,7 +223,7 @@ func (a adminAPIHandlers) SRPeerReplicateBucketItem(w http.ResponseWriter, r *ht
 		err = errSRInvalidRequest(errInvalidArgument)
 	case madmin.SRBucketMetaTypePolicy:
 		if item.Policy == nil {
-			err = globalSiteReplicationSys.PeerBucketPolicyHandler(ctx, item.Bucket, nil)
+			err = globalSiteReplicationSys.PeerBucketPolicyHandler(ctx, item.Bucket, nil, item.UpdatedAt)
 		} else {
 			bktPolicy, berr := policy.ParseConfig(bytes.NewReader(item.Policy), item.Bucket)
 			if berr != nil {
@@ -220,31 +231,33 @@ func (a adminAPIHandlers) SRPeerReplicateBucketItem(w http.ResponseWriter, r *ht
 				return
 			}
 			if bktPolicy.IsEmpty() {
-				err = globalSiteReplicationSys.PeerBucketPolicyHandler(ctx, item.Bucket, nil)
+				err = globalSiteReplicationSys.PeerBucketPolicyHandler(ctx, item.Bucket, nil, item.UpdatedAt)
 			} else {
-				err = globalSiteReplicationSys.PeerBucketPolicyHandler(ctx, item.Bucket, bktPolicy)
+				err = globalSiteReplicationSys.PeerBucketPolicyHandler(ctx, item.Bucket, bktPolicy, item.UpdatedAt)
 			}
 		}
 	case madmin.SRBucketMetaTypeQuotaConfig:
 		if item.Quota == nil {
-			err = globalSiteReplicationSys.PeerBucketQuotaConfigHandler(ctx, item.Bucket, nil)
+			err = globalSiteReplicationSys.PeerBucketQuotaConfigHandler(ctx, item.Bucket, nil, item.UpdatedAt)
 		} else {
 			quotaConfig, err := parseBucketQuota(item.Bucket, item.Quota)
 			if err != nil {
 				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 				return
 			}
-			if err = globalSiteReplicationSys.PeerBucketQuotaConfigHandler(ctx, item.Bucket, quotaConfig); err != nil {
+			if err = globalSiteReplicationSys.PeerBucketQuotaConfigHandler(ctx, item.Bucket, quotaConfig, item.UpdatedAt); err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
 			}
 		}
+	case madmin.SRBucketMetaTypeVersionConfig:
+		err = globalSiteReplicationSys.PeerBucketVersioningHandler(ctx, item.Bucket, item.Versioning, item.UpdatedAt)
 	case madmin.SRBucketMetaTypeTags:
-		err = globalSiteReplicationSys.PeerBucketTaggingHandler(ctx, item.Bucket, item.Tags)
+		err = globalSiteReplicationSys.PeerBucketTaggingHandler(ctx, item.Bucket, item.Tags, item.UpdatedAt)
 	case madmin.SRBucketMetaTypeObjectLockConfig:
-		err = globalSiteReplicationSys.PeerBucketObjectLockConfigHandler(ctx, item.Bucket, item.ObjectLockConfig)
+		err = globalSiteReplicationSys.PeerBucketObjectLockConfigHandler(ctx, item.Bucket, item.ObjectLockConfig, item.UpdatedAt)
 	case madmin.SRBucketMetaTypeSSEConfig:
-		err = globalSiteReplicationSys.PeerBucketSSEConfigHandler(ctx, item.Bucket, item.SSEConfig)
+		err = globalSiteReplicationSys.PeerBucketSSEConfigHandler(ctx, item.Bucket, item.SSEConfig, item.UpdatedAt)
 	}
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -294,7 +307,7 @@ func (a adminAPIHandlers) SRPeerGetIDPSettings(w http.ResponseWriter, r *http.Re
 }
 
 func parseJSONBody(ctx context.Context, body io.Reader, v interface{}, encryptionKey string) error {
-	data, err := ioutil.ReadAll(body)
+	data, err := io.ReadAll(body)
 	if err != nil {
 		return SRError{
 			Cause: err,
@@ -432,6 +445,7 @@ func getSRStatusOptions(r *http.Request) (opts madmin.SRStatusOptions) {
 	opts.Users = q.Get("users") == "true"
 	opts.Entity = madmin.GetSREntityType(q.Get("entity"))
 	opts.EntityValue = q.Get("entityvalue")
+	opts.ShowDeleted = q.Get("showDeleted") == "true"
 	return
 }
 
@@ -489,4 +503,87 @@ func (a adminAPIHandlers) SRPeerRemove(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
+}
+
+// SiteReplicationResyncOp - PUT /minio/admin/v3/site-replication/resync/op
+func (a adminAPIHandlers) SiteReplicationResyncOp(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SiteReplicationResyncOp")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SiteReplicationResyncAction)
+	if objectAPI == nil {
+		return
+	}
+
+	var peerSite madmin.PeerInfo
+	if err := parseJSONBody(ctx, r.Body, &peerSite, ""); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	vars := mux.Vars(r)
+	op := madmin.SiteResyncOp(vars["operation"])
+	var (
+		status madmin.SRResyncOpStatus
+		err    error
+	)
+	switch op {
+	case madmin.SiteResyncStart:
+		status, err = globalSiteReplicationSys.startResync(ctx, objectAPI, peerSite)
+	case madmin.SiteResyncCancel:
+		status, err = globalSiteReplicationSys.cancelResync(ctx, objectAPI, peerSite)
+	default:
+		err = errSRInvalidRequest(errInvalidArgument)
+	}
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	body, err := json.Marshal(status)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	writeSuccessResponseJSON(w, body)
+}
+
+// SiteReplicationDevNull - everything goes to io.Discard
+// [POST] /minio/admin/v3/site-replication/devnull
+func (a *adminAPIHandlers) SiteReplicationDevNull(w http.ResponseWriter, r *http.Request) {
+	globalSiteNetPerfRX.Connect()
+	defer globalSiteNetPerfRX.Disconnect()
+
+	connectTime := time.Now()
+	ctx := newContext(r, w, "SiteReplicationDevNull")
+	for {
+		n, err := io.CopyN(io.Discard, r.Body, 128*humanize.KiByte)
+		atomic.AddUint64(&globalSiteNetPerfRX.RX, uint64(n))
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			// If there is a disconnection before globalNetPerfMinDuration (we give a margin of error of 1 sec)
+			// would mean the network is not stable. Logging here will help in debugging network issues.
+			if time.Since(connectTime) < (globalNetPerfMinDuration - time.Second) {
+				logger.LogIf(ctx, err)
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				w.WriteHeader(http.StatusBadRequest)
+			}
+			break
+		}
+	}
+}
+
+// SiteReplicationNetPerf - everything goes to io.Discard
+// [POST] /minio/admin/v3/site-replication/netperf
+func (a *adminAPIHandlers) SiteReplicationNetPerf(w http.ResponseWriter, r *http.Request) {
+	durationStr := r.Form.Get(peerRESTDuration)
+	duration, _ := time.ParseDuration(durationStr)
+	if duration < globalNetPerfMinDuration {
+		duration = globalNetPerfMinDuration
+	}
+	result := siteNetperf(r.Context(), duration)
+	logger.LogIf(r.Context(), gob.NewEncoder(w).Encode(result))
 }

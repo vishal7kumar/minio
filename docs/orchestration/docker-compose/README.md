@@ -39,7 +39,7 @@ or
 docker stack deploy --compose-file docker-compose.yaml minio
 ```
 
-Distributed instances are now accessible on the host at ports 9000, proceed to access the Web browser at <http://127.0.0.1:9000/>. Here 4 MinIO server instances are reverse proxied through Nginx load balancing.
+Distributed instances are now accessible on the host using the Minio CLI on port 9000 and the Minio Web Console on port 9001. Proceed to access the Web browser at <http://127.0.0.1:9001/>. Here 4 MinIO server instances are reverse proxied through Nginx load balancing.
 
 ### Notes
 
@@ -50,10 +50,10 @@ Distributed instances are now accessible on the host at ports 9000, proceed to a
   * Update the command section in each service.
   * Add a new MinIO server instance to the upstream directive in the Nginx configuration file.
 
-  Read more about distributed MinIO [here](https://docs.min.io/docs/distributed-minio-quickstart-guide).
+  Read more about distributed MinIO [here](https://min.io/docs/minio/container/operations/install-deploy-manage/deploy-minio-single-node-multi-drive.html).
 
 ### Explore Further
 
 * [Overview of Docker Compose](https://docs.docker.com/compose/overview/)
-* [MinIO Docker Quickstart Guide](https://docs.min.io/docs/minio-docker-quickstart-guide)
-* [MinIO Erasure Code QuickStart Guide](https://docs.min.io/docs/minio-erasure-code-quickstart-guide)
+* [MinIO Docker Quickstart Guide](https://min.io/docs/minio/container/index.html#quickstart-for-containers)
+* [MinIO Erasure Code QuickStart Guide](https://min.io/docs/minio/container/operations/concepts/erasure-coding.html)

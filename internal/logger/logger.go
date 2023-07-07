@@ -20,10 +20,8 @@ package logger
 import (
 	"context"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"go/build"
-	"net/http"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -31,26 +29,31 @@ import (
 	"time"
 
 	"github.com/minio/highwayhash"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger/message/log"
+	"github.com/minio/pkg/logger/message/log"
 )
 
 // HighwayHash key for logging in anonymous mode
 var magicHighwayHash256Key = []byte("\x4b\xe7\x34\xfa\x8e\x23\x8a\xcd\x26\x3e\x83\xe6\xbb\x96\x85\x52\x04\x0f\x93\x5d\xa3\x9f\x44\x14\x97\xe0\x9d\x13\x22\xde\x36\xa0")
 
-// Disable disables all logging, false by default. (used for "go test")
-var Disable = false
-
-// Level type
-type Level int8
+// LogLevel type
+type LogLevel int8
 
 // Enumerated level types
 const (
-	InformationLvl Level = iota + 1
+	InfoLvl LogLevel = iota + 1
 	ErrorLvl
 	FatalLvl
+
+	Application = madmin.LogKindApplication
+	Minio       = madmin.LogKindMinio
+	All         = madmin.LogKindAll
 )
+
+// MinimumLogLevel holds the minimum logging level to print - info by default
+var MinimumLogLevel = InfoLvl
 
 var trimStrings []string
 
@@ -60,21 +63,19 @@ const TimeFormat string = "15:04:05 MST 01/02/2006"
 var matchingFuncNames = [...]string{
 	"http.HandlerFunc.ServeHTTP",
 	"cmd.serverMain",
-	"cmd.StartGateway",
 	// add more here ..
 }
 
-func (level Level) String() string {
-	var lvlStr string
+func (level LogLevel) String() string {
 	switch level {
-	case InformationLvl:
-		lvlStr = "INFO"
+	case InfoLvl:
+		return "INFO"
 	case ErrorLvl:
-		lvlStr = "ERROR"
+		return "ERROR"
 	case FatalLvl:
-		lvlStr = "FATAL"
+		return "FATAL"
 	}
-	return lvlStr
+	return ""
 }
 
 // quietFlag: Hide startup messages if enabled
@@ -230,24 +231,12 @@ func getTrace(traceLevel int) []string {
 	return trace
 }
 
-// Return the highway hash of the passed string
-func hashString(input string) string {
+// HashString - return the highway hash of the passed string
+func HashString(input string) string {
 	hh, _ := highwayhash.New(magicHighwayHash256Key)
 	hh.Write([]byte(input))
 	return hex.EncodeToString(hh.Sum(nil))
 }
-
-// Kind specifies the kind of error log
-type Kind string
-
-const (
-	// Minio errors
-	Minio Kind = "MINIO"
-	// Application errors
-	Application Kind = "APPLICATION"
-	// All errors
-	All Kind = "ALL"
-)
 
 // LogAlwaysIf prints a detailed error message during
 // the execution of the server.
@@ -263,31 +252,17 @@ func LogAlwaysIf(ctx context.Context, err error, errKind ...interface{}) {
 // the execution of the server, if it is not an
 // ignored error.
 func LogIf(ctx context.Context, err error, errKind ...interface{}) {
-	if err == nil {
+	if logIgnoreError(err) {
 		return
 	}
-
-	if errors.Is(err, context.Canceled) {
-		return
-	}
-
-	if err.Error() == http.ErrServerClosed.Error() || err.Error() == "disk not found" {
-		return
-	}
-
 	logIf(ctx, err, errKind...)
 }
 
-// logIf prints a detailed error message during
-// the execution of the server.
-func logIf(ctx context.Context, err error, errKind ...interface{}) {
-	if Disable {
-		return
-	}
-	logKind := string(Minio)
+func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entry {
+	logKind := madmin.LogKindAll
 	if len(errKind) > 0 {
-		if ek, ok := errKind[0].(Kind); ok {
-			logKind = string(ek)
+		if ek, ok := errKind[0].(madmin.LogKind); ok {
+			logKind = ek
 		}
 	}
 	req := GetReqInfo(ctx)
@@ -295,15 +270,17 @@ func logIf(ctx context.Context, err error, errKind ...interface{}) {
 	if req == nil {
 		req = &ReqInfo{API: "SYSTEM"}
 	}
+	req.RLock()
+	defer req.RUnlock()
 
 	API := "SYSTEM"
 	if req.API != "" {
 		API = req.API
 	}
 
-	kv := req.GetTags()
-	tags := make(map[string]interface{}, len(kv))
-	for _, entry := range kv {
+	// Copy tags. We hold read lock already.
+	tags := make(map[string]interface{}, len(req.tags))
+	for _, entry := range req.tags {
 		tags[entry.Key] = entry.Val
 	}
 
@@ -312,8 +289,9 @@ func logIf(ctx context.Context, err error, errKind ...interface{}) {
 
 	// Get the cause for the Error
 	message := fmt.Sprintf("%v (%T)", err, err)
+	deploymentID := req.DeploymentID
 	if req.DeploymentID == "" {
-		req.DeploymentID = xhttp.GlobalDeploymentID
+		deploymentID = xhttp.GlobalDeploymentID
 	}
 
 	objects := make([]log.ObjectVersion, 0, len(req.Objects))
@@ -325,7 +303,7 @@ func logIf(ctx context.Context, err error, errKind ...interface{}) {
 	}
 
 	entry := log.Entry{
-		DeploymentID: req.DeploymentID,
+		DeploymentID: deploymentID,
 		Level:        ErrorLvl.String(),
 		LogKind:      logKind,
 		RemoteHost:   req.RemoteHost,
@@ -350,19 +328,48 @@ func logIf(ctx context.Context, err error, errKind ...interface{}) {
 	}
 
 	if anonFlag {
-		entry.API.Args.Bucket = hashString(entry.API.Args.Bucket)
-		entry.API.Args.Object = hashString(entry.API.Args.Object)
-		entry.RemoteHost = hashString(entry.RemoteHost)
+		entry.API.Args.Bucket = HashString(entry.API.Args.Bucket)
+		entry.API.Args.Object = HashString(entry.API.Args.Object)
+		entry.RemoteHost = HashString(entry.RemoteHost)
 		entry.Trace.Message = reflect.TypeOf(err).String()
 		entry.Trace.Variables = make(map[string]interface{})
 	}
 
+	return entry
+}
+
+// consoleLogIf prints a detailed error message during
+// the execution of the server.
+func consoleLogIf(ctx context.Context, err error, errKind ...interface{}) {
+	if MinimumLogLevel > ErrorLvl {
+		return
+	}
+
+	if consoleTgt != nil {
+		entry := errToEntry(ctx, err, errKind...)
+		consoleTgt.Send(ctx, entry)
+	}
+}
+
+// logIf prints a detailed error message during
+// the execution of the server.
+func logIf(ctx context.Context, err error, errKind ...interface{}) {
+	if MinimumLogLevel > ErrorLvl {
+		return
+	}
+
+	systemTgts := SystemTargets()
+	if len(systemTgts) == 0 {
+		return
+	}
+
+	entry := errToEntry(ctx, err, errKind...)
 	// Iterate over all logger targets to send the log entry
-	for _, t := range SystemTargets() {
-		if err := t.Send(entry, entry.LogKind); err != nil {
+	for _, t := range systemTgts {
+		if err := t.Send(ctx, entry); err != nil {
 			if consoleTgt != nil {
 				entry.Trace.Message = fmt.Sprintf("event(%#v) was not sent to Logger target (%#v): %#v", entry, t, err)
-				consoleTgt.Send(entry, entry.LogKind)
+				consoleTgt.Send(ctx, entry)
 			}
 		}
 	}

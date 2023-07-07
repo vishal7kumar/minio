@@ -20,17 +20,19 @@ package cmd
 import (
 	"net/http"
 
-	"github.com/gorilla/mux"
 	"github.com/klauspost/compress/gzhttp"
 	"github.com/klauspost/compress/gzip"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/mux"
 )
 
 const (
-	adminPathPrefix       = minioReservedBucketPath + "/admin"
-	adminAPIVersion       = madmin.AdminAPIVersion
-	adminAPIVersionPrefix = SlashSeparator + adminAPIVersion
+	adminPathPrefix                = minioReservedBucketPath + "/admin"
+	adminAPIVersion                = madmin.AdminAPIVersion
+	adminAPIVersionPrefix          = SlashSeparator + adminAPIVersion
+	adminAPISiteReplicationDevNull = "/site-replication/devnull"
+	adminAPISiteReplicationNetPerf = "/site-replication/netperf"
 )
 
 // adminAPIHandlers provides HTTP handlers for MinIO admin API.
@@ -60,12 +62,14 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 
 		// Info operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/info").HandlerFunc(gz(httpTraceAll(adminAPI.ServerInfoHandler)))
-		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/inspect-data").HandlerFunc(httpTraceHdrs(adminAPI.InspectDataHandler)).Queries("volume", "{volume:.*}", "file", "{file:.*}")
+		adminRouter.Methods(http.MethodGet, http.MethodPost).Path(adminVersion + "/inspect-data").HandlerFunc(httpTraceAll(adminAPI.InspectDataHandler))
 
 		// StorageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/storageinfo").HandlerFunc(gz(httpTraceAll(adminAPI.StorageInfoHandler)))
 		// DataUsageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/datausageinfo").HandlerFunc(gz(httpTraceAll(adminAPI.DataUsageInfoHandler)))
+		// Metrics operation
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/metrics").HandlerFunc(gz(httpTraceAll(adminAPI.MetricsHandler)))
 
 		if globalIsDistErasure || globalIsErasure {
 			// Heal operations
@@ -82,12 +86,19 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 
 			adminRouter.Methods(http.MethodPost).Path(adminVersion+"/pools/decommission").HandlerFunc(gz(httpTraceAll(adminAPI.StartDecommission))).Queries("pool", "{pool:.*}")
 			adminRouter.Methods(http.MethodPost).Path(adminVersion+"/pools/cancel").HandlerFunc(gz(httpTraceAll(adminAPI.CancelDecommission))).Queries("pool", "{pool:.*}")
+
+			// Rebalance operations
+			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/rebalance/start").HandlerFunc(gz(httpTraceAll(adminAPI.RebalanceStart)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/rebalance/status").HandlerFunc(gz(httpTraceAll(adminAPI.RebalanceStatus)))
+			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/rebalance/stop").HandlerFunc(gz(httpTraceAll(adminAPI.RebalanceStop)))
 		}
 
-		// Profiling operations
+		// Profiling operations - deprecated API
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/profiling/start").HandlerFunc(gz(httpTraceAll(adminAPI.StartProfilingHandler))).
 			Queries("profilerType", "{profilerType:.*}")
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/profiling/download").HandlerFunc(gz(httpTraceAll(adminAPI.DownloadProfilingHandler)))
+		// Profiling operations
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/profile").HandlerFunc(gz(httpTraceAll(adminAPI.ProfileHandler)))
 
 		// Config KV operations.
 		if enableConfigOps {
@@ -133,11 +144,17 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/list-service-accounts").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListServiceAccounts)))
 		adminRouter.Methods(http.MethodDelete).Path(adminVersion+"/delete-service-account").HandlerFunc(gz(httpTraceHdrs(adminAPI.DeleteServiceAccount))).Queries("accessKey", "{accessKey:.*}")
 
+		// STS accounts ops
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/temporary-account-info").HandlerFunc(gz(httpTraceHdrs(adminAPI.TemporaryAccountInfo))).Queries("accessKey", "{accessKey:.*}")
+
 		// Info policy IAM latest
 		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/info-canned-policy").HandlerFunc(gz(httpTraceHdrs(adminAPI.InfoCannedPolicy))).Queries("name", "{name:.*}")
 		// List policies latest
 		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/list-canned-policies").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListBucketPolicies))).Queries("bucket", "{bucket:.*}")
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/list-canned-policies").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListCannedPolicies)))
+
+		// Builtin IAM policy associations
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp/builtin/policy-entities").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListPolicyMappingEntities)))
 
 		// Remove policy IAM
 		adminRouter.Methods(http.MethodDelete).Path(adminVersion+"/remove-canned-policy").HandlerFunc(gz(httpTraceHdrs(adminAPI.RemoveCannedPolicy))).Queries("name", "{name:.*}")
@@ -146,6 +163,9 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-user-or-group-policy").
 			HandlerFunc(gz(httpTraceHdrs(adminAPI.SetPolicyForUserOrGroup))).
 			Queries("policyName", "{policyName:.*}", "userOrGroup", "{userOrGroup:.*}", "isGroup", "{isGroup:true|false}")
+
+		// Attach/Detach policies to/from user or group
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/idp/builtin/policy/{operation}").HandlerFunc(gz(httpTraceHdrs(adminAPI.AttachDetachPolicyBuiltin)))
 
 		// Remove user IAM
 		adminRouter.Methods(http.MethodDelete).Path(adminVersion+"/remove-user").HandlerFunc(gz(httpTraceHdrs(adminAPI.RemoveUser))).Queries("accessKey", "{accessKey:.*}")
@@ -168,50 +188,92 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		// Set Group Status
 		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-group-status").HandlerFunc(gz(httpTraceHdrs(adminAPI.SetGroupStatus))).Queries("group", "{group:.*}").Queries("status", "{status:.*}")
 
-		if globalIsDistErasure || globalIsErasure {
-			// GetBucketQuotaConfig
-			adminRouter.Methods(http.MethodGet).Path(adminVersion+"/get-bucket-quota").HandlerFunc(
-				gz(httpTraceHdrs(adminAPI.GetBucketQuotaConfigHandler))).Queries("bucket", "{bucket:.*}")
-			// PutBucketQuotaConfig
-			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-bucket-quota").HandlerFunc(
-				gz(httpTraceHdrs(adminAPI.PutBucketQuotaConfigHandler))).Queries("bucket", "{bucket:.*}")
+		// Export IAM info to zipped file
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/export-iam").HandlerFunc(httpTraceHdrs(adminAPI.ExportIAM))
 
-			// Bucket replication operations
-			// GetBucketTargetHandler
-			adminRouter.Methods(http.MethodGet).Path(adminVersion+"/list-remote-targets").HandlerFunc(
-				gz(httpTraceHdrs(adminAPI.ListRemoteTargetsHandler))).Queries("bucket", "{bucket:.*}", "type", "{type:.*}")
-			// SetRemoteTargetHandler
-			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-remote-target").HandlerFunc(
-				gz(httpTraceHdrs(adminAPI.SetRemoteTargetHandler))).Queries("bucket", "{bucket:.*}")
-			// RemoveRemoteTargetHandler
-			adminRouter.Methods(http.MethodDelete).Path(adminVersion+"/remove-remote-target").HandlerFunc(
-				gz(httpTraceHdrs(adminAPI.RemoveRemoteTargetHandler))).Queries("bucket", "{bucket:.*}", "arn", "{arn:.*}")
+		// Import IAM info
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/import-iam").HandlerFunc(httpTraceHdrs(adminAPI.ImportIAM))
 
-			// Remote Tier management operations
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/tier").HandlerFunc(gz(httpTraceHdrs(adminAPI.AddTierHandler)))
-			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.EditTierHandler)))
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListTierHandler)))
-			adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.RemoveTierHandler)))
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.VerifyTierHandler)))
-			// Tier stats
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier-stats").HandlerFunc(gz(httpTraceHdrs(adminAPI.TierStatsHandler)))
+		// IDentity Provider configuration APIs
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(gz(httpTraceHdrs(adminAPI.AddIdentityProviderCfg)))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(gz(httpTraceHdrs(adminAPI.UpdateIdentityProviderCfg)))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp-config/{type}").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListIdentityProviderCfg)))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(gz(httpTraceHdrs(adminAPI.GetIdentityProviderCfg)))
+		adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(gz(httpTraceHdrs(adminAPI.DeleteIdentityProviderCfg)))
 
-			// Cluster Replication APIs
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/add").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationAdd)))
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/remove").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationRemove)))
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/info").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationInfo)))
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/metainfo").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationMetaInfo)))
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/status").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationStatus)))
+		// LDAP IAM operations
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp/ldap/policy-entities").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListLDAPPolicyMappingEntities)))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/idp/ldap/policy/{operation}").HandlerFunc(gz(httpTraceHdrs(adminAPI.AttachDetachPolicyLDAP)))
+		// -- END IAM APIs --
 
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/join").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerJoin)))
-			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/site-replication/peer/bucket-ops").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerBucketOps))).Queries("bucket", "{bucket:.*}").Queries("operation", "{operation:.*}")
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/iam-item").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerReplicateIAMItem)))
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/bucket-meta").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerReplicateBucketItem)))
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/peer/idp-settings").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerGetIDPSettings)))
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/edit").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationEdit)))
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/edit").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerEdit)))
-			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/remove").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerRemove)))
-		}
+		// GetBucketQuotaConfig
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/get-bucket-quota").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.GetBucketQuotaConfigHandler))).Queries("bucket", "{bucket:.*}")
+		// PutBucketQuotaConfig
+		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-bucket-quota").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.PutBucketQuotaConfigHandler))).Queries("bucket", "{bucket:.*}")
+
+		// Bucket replication operations
+		// GetBucketTargetHandler
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/list-remote-targets").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.ListRemoteTargetsHandler))).Queries("bucket", "{bucket:.*}", "type", "{type:.*}")
+		// SetRemoteTargetHandler
+		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-remote-target").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.SetRemoteTargetHandler))).Queries("bucket", "{bucket:.*}")
+		// RemoveRemoteTargetHandler
+		adminRouter.Methods(http.MethodDelete).Path(adminVersion+"/remove-remote-target").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.RemoveRemoteTargetHandler))).Queries("bucket", "{bucket:.*}", "arn", "{arn:.*}")
+		// ReplicationDiff - MinIO extension API
+		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/replication/diff").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.ReplicationDiffHandler))).Queries("bucket", "{bucket:.*}")
+
+		// Batch job operations
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/start-job").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.StartBatchJob)))
+
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/list-jobs").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.ListBatchJobs)))
+
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/describe-job").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.DescribeBatchJob)))
+		adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/cancel-job").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.CancelBatchJob)))
+
+		// Bucket migration operations
+		// ExportBucketMetaHandler
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/export-bucket-metadata").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.ExportBucketMetadataHandler)))
+		// ImportBucketMetaHandler
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/import-bucket-metadata").HandlerFunc(
+			gz(httpTraceHdrs(adminAPI.ImportBucketMetadataHandler)))
+
+		// Remote Tier management operations
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/tier").HandlerFunc(gz(httpTraceHdrs(adminAPI.AddTierHandler)))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.EditTierHandler)))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListTierHandler)))
+		adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.RemoveTierHandler)))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.VerifyTierHandler)))
+		// Tier stats
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier-stats").HandlerFunc(gz(httpTraceHdrs(adminAPI.TierStatsHandler)))
+
+		// Cluster Replication APIs
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/add").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationAdd)))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/remove").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationRemove)))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/info").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationInfo)))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/metainfo").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationMetaInfo)))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/status").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationStatus)))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + adminAPISiteReplicationDevNull).HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationDevNull)))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + adminAPISiteReplicationNetPerf).HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationNetPerf)))
+
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/join").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerJoin)))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/site-replication/peer/bucket-ops").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerBucketOps))).Queries("bucket", "{bucket:.*}").Queries("operation", "{operation:.*}")
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/iam-item").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerReplicateIAMItem)))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/bucket-meta").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerReplicateBucketItem)))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/peer/idp-settings").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerGetIDPSettings)))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/edit").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationEdit)))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/edit").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerEdit)))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/remove").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerRemove)))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/site-replication/resync/op").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationResyncOp))).Queries("operation", "{operation:.*}")
 
 		if globalIsDistErasure {
 			// Top locks
@@ -221,10 +283,11 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 				Queries("paths", "{paths:.*}").HandlerFunc(gz(httpTraceHdrs(adminAPI.ForceUnlockHandler)))
 		}
 
-		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest").HandlerFunc(httpTraceHdrs(adminAPI.SpeedtestHandler))
-		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest/object").HandlerFunc(httpTraceHdrs(adminAPI.ObjectSpeedtestHandler))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest").HandlerFunc(httpTraceHdrs(adminAPI.SpeedTestHandler))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest/object").HandlerFunc(httpTraceHdrs(adminAPI.ObjectSpeedTestHandler))
 		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest/drive").HandlerFunc(httpTraceHdrs(adminAPI.DriveSpeedtestHandler))
 		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest/net").HandlerFunc(httpTraceHdrs(adminAPI.NetperfHandler))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest/site").HandlerFunc(httpTraceHdrs(adminAPI.SitePerfHandler))
 
 		// HTTP Trace
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/trace").HandlerFunc(gz(http.HandlerFunc(adminAPI.TraceHandler)))
@@ -238,16 +301,12 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/kms/key/create").HandlerFunc(gz(httpTraceAll(adminAPI.KMSCreateKeyHandler))).Queries("key-id", "{key-id:.*}")
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/kms/key/status").HandlerFunc(gz(httpTraceAll(adminAPI.KMSKeyStatusHandler)))
 
-		if !globalIsGateway {
-			// Keep obdinfo for backward compatibility with mc
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/obdinfo").
-				HandlerFunc(gz(httpTraceHdrs(adminAPI.HealthInfoHandler)))
-			// -- Health API --
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/healthinfo").
-				HandlerFunc(gz(httpTraceHdrs(adminAPI.HealthInfoHandler)))
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/bandwidth").
-				HandlerFunc(gz(httpTraceHdrs(adminAPI.BandwidthMonitorHandler)))
-		}
+		// Keep obdinfo for backward compatibility with mc
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/obdinfo").
+			HandlerFunc(gz(httpTraceHdrs(adminAPI.HealthInfoHandler)))
+		// -- Health API --
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/healthinfo").
+			HandlerFunc(gz(httpTraceHdrs(adminAPI.HealthInfoHandler)))
 	}
 
 	// If none of the routes match add default error handler routes

@@ -19,6 +19,12 @@ package config
 
 // UI errors
 var (
+	ErrInvalidXLValue = newErrFn(
+		"Invalid drive path",
+		"Please provide a fresh drive for single drive MinIO setup",
+		"MinIO only supports fresh drive paths",
+	)
+
 	ErrInvalidBrowserValue = newErrFn(
 		"Invalid console value",
 		"Please check the passed value",
@@ -46,7 +52,7 @@ var (
 	ErrInvalidErasureSetSize = newErrFn(
 		"Invalid erasure set size",
 		"Please check the passed value",
-		"Erasure set can only accept any of [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] values",
+		"Erasure set can only accept any of [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] values",
 	)
 
 	ErrInvalidWormValue = newErrFn(
@@ -97,12 +103,6 @@ var (
 		"MINIO_CACHE_WATERMARK_HIGH: Valid cache high watermark value must be between 0-100",
 	)
 
-	ErrInvalidCacheEncryptionKey = newErrFn(
-		"Invalid cache encryption master key value",
-		"Please check the passed value",
-		"MINIO_CACHE_ENCRYPTION_SECRET_KEY: For more information, please refer to https://docs.min.io/docs/minio-disk-cache-guide",
-	)
-
 	ErrInvalidCacheRange = newErrFn(
 		"Invalid cache range value",
 		"Please check the passed value",
@@ -121,10 +121,10 @@ var (
 		"MINIO_CACHE_AFTER cannot be used with MINIO_CACHE_COMMIT setting",
 	)
 
-	ErrInvalidCredentialsBackendEncrypted = newErrFn(
-		"Invalid credentials",
-		"Please set correct credentials in the environment for decryption",
-		`Detected encrypted config backend, correct access and secret keys should be specified via environment variables MINIO_ROOT_USER and MINIO_ROOT_PASSWORD to be able to decrypt the MinIO config, user IAM and policies`,
+	ErrInvalidConfigDecryptionKey = newErrFn(
+		"Incorrect encryption key to decrypt internal data",
+		"Please set the correct default KMS key value or the correct root credentials for older MinIO versions.",
+		`Revert MINIO_KMS_KES_KEY_NAME or MINIO_ROOT_USER/MINIO_ROOT_PASSWORD (for older MinIO versions) to be able to decrypt the internal data again.`,
 	)
 
 	ErrInvalidCredentials = newErrFn(
@@ -160,13 +160,13 @@ var (
 	ErrInvalidErasureEndpoints = newErrFn(
 		"Invalid endpoint(s) in erasure mode",
 		"Please provide correct combination of local/remote paths",
-		"For more information, please refer to https://docs.min.io/docs/minio-erasure-code-quickstart-guide",
+		"For more information, please refer to https://min.io/docs/minio/linux/operations/concepts/erasure-coding.html",
 	)
 
 	ErrInvalidNumberOfErasureEndpoints = newErrFn(
 		"Invalid total number of endpoints for erasure mode",
-		"Please provide an even number of endpoints greater or equal to 4",
-		"For more information, please refer to https://docs.min.io/docs/minio-erasure-code-quickstart-guide",
+		"Please provide number of endpoints greater or equal to 2",
+		"For more information, please refer to https://min.io/docs/minio/linux/operations/concepts/erasure-coding.html",
 	)
 
 	ErrStorageClassValue = newErrFn(
@@ -192,17 +192,18 @@ Refer to the link https://github.com/minio/minio/tree/master/docs/erasure/storag
 		  --address '[fe80::da00:a6c8:e3ae:ddd7]:9000'`,
 	)
 
-	ErrInvalidFSEndpoint = newErrFn(
-		"Invalid endpoint for standalone FS mode",
-		"Please check the FS endpoint",
-		`FS mode requires only one writable disk path
-Example 1:
-   $ minio server /data/minio/`,
+	ErrInvalidEndpoint = newErrFn(
+		"Invalid endpoint for single drive mode",
+		"Please check the endpoint",
+		`Single-Node modes requires absolute path without hostnames:
+Examples:
+   $ minio server /data/minio/ #Single Node Single Drive
+   $ minio server /data-{1...4}/minio # Single Node Multi Drive`,
 	)
 
 	ErrUnsupportedBackend = newErrFn(
 		"Unable to write to the backend",
-		"Please ensure your disk supports O_DIRECT",
+		"Please ensure your drive supports O_DIRECT",
 		"",
 	)
 
@@ -224,19 +225,19 @@ Example 1:
 		`Use 'sudo setcap cap_net_bind_service=+ep /path/to/minio' to provide sufficient permissions`,
 	)
 
-	ErrSSLUnexpectedError = newErrFn(
-		"Invalid TLS certificate",
-		"Please check the content of your certificate data",
-		`Only PEM (x.509) format is accepted as valid public & private certificates`,
+	ErrTLSReadError = newErrFn(
+		"Cannot read the TLS certificate",
+		"Please check if the certificate has the proper owner and read permissions",
+		"",
 	)
 
-	ErrSSLUnexpectedData = newErrFn(
+	ErrTLSUnexpectedData = newErrFn(
 		"Invalid TLS certificate",
 		"Please check your certificate",
 		"",
 	)
 
-	ErrSSLNoPassword = newErrFn(
+	ErrTLSNoPassword = newErrFn(
 		"Missing TLS password",
 		"Please set the password to environment variable `MINIO_CERT_PASSWD` so that the private key can be decrypted",
 		"",
@@ -245,7 +246,7 @@ Example 1:
 	ErrNoCertsAndHTTPSEndpoints = newErrFn(
 		"HTTPS specified in endpoints, but no TLS certificate is found on the local machine",
 		"Please add TLS certificate or use HTTP endpoints only",
-		"Refer to https://docs.min.io/docs/how-to-secure-access-to-minio-server-with-tls for information about how to load a TLS certificate in your server",
+		"Refer to https://min.io/docs/minio/linux/operations/network-encryption.html for information about how to load a TLS certificate in your server",
 	)
 
 	ErrCertsAndHTTPEndpoints = newErrFn(
@@ -254,7 +255,7 @@ Example 1:
 		"",
 	)
 
-	ErrSSLWrongPassword = newErrFn(
+	ErrTLSWrongPassword = newErrFn(
 		"Unable to decrypt the private key using the provided password",
 		"Please set the correct password in environment variable `MINIO_CERT_PASSWD`",
 		"",
@@ -270,18 +271,6 @@ Example 1:
 		"Invalid compression include value",
 		"Please check the passed value",
 		"Compress extensions/mime-types are delimited by `,`. For eg, MINIO_COMPRESS_MIME_TYPES=\"A,B,C\"",
-	)
-
-	ErrInvalidGWSSEValue = newErrFn(
-		"Invalid gateway SSE value",
-		"Please check the passed value",
-		"MINIO_GATEWAY_SSE: Gateway SSE accepts only C and S3 as valid values. Delimit by `;` to set more than one value",
-	)
-
-	ErrInvalidGWSSEEnvValue = newErrFn(
-		"Invalid gateway SSE configuration",
-		"",
-		"Refer to https://docs.min.io/docs/minio-kms-quickstart-guide.html for setting up SSE",
 	)
 
 	ErrInvalidReplicationWorkersValue = newErrFn(

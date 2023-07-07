@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -20,22 +20,27 @@ package cmd
 import (
 	"bytes"
 	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/hex"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	iampolicy "github.com/minio/pkg/iam/policy"
+	"golang.org/x/exp/slices"
 )
 
 // http Header "x-amz-content-sha256" == "UNSIGNED-PAYLOAD" indicates that the
 // client did not calculate sha256 of the payload.
 const unsignedPayload = "UNSIGNED-PAYLOAD"
+
+// http Header "x-amz-content-sha256" == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" indicates that the
+// client did not calculate sha256 of the payload and there is a trailer.
+const unsignedPayloadTrailer = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
 
 // skipContentSha256Cksum returns true if caller needs to skip
 // payload checksum, false if not.
@@ -62,7 +67,7 @@ func skipContentSha256Cksum(r *http.Request) bool {
 	// If x-amz-content-sha256 is set and the value is not
 	// 'UNSIGNED-PAYLOAD' we should validate the content sha256.
 	switch v[0] {
-	case unsignedPayload:
+	case unsignedPayload, unsignedPayloadTrailer:
 		return true
 	case emptySHA256:
 		// some broken clients set empty-sha256
@@ -70,12 +75,11 @@ func skipContentSha256Cksum(r *http.Request) bool {
 		// we should skip such clients and allow
 		// blindly such insecure clients only if
 		// S3 strict compatibility is disabled.
-		if r.ContentLength > 0 && !globalCLIContext.StrictS3Compat {
-			// We return true only in situations when
-			// deployment has asked MinIO to allow for
-			// such broken clients and content-length > 0.
-			return true
-		}
+
+		// We return true only in situations when
+		// deployment has asked MinIO to allow for
+		// such broken clients and content-length > 0.
+		return r.ContentLength > 0 && !globalCLIContext.StrictS3Compat
 	}
 	return false
 }
@@ -83,12 +87,12 @@ func skipContentSha256Cksum(r *http.Request) bool {
 // Returns SHA256 for calculating canonical-request.
 func getContentSha256Cksum(r *http.Request, stype serviceType) string {
 	if stype == serviceSTS {
-		payload, err := ioutil.ReadAll(io.LimitReader(r.Body, stsRequestBodyLimit))
+		payload, err := io.ReadAll(io.LimitReader(r.Body, stsRequestBodyLimit))
 		if err != nil {
 			logger.CriticalIf(GlobalContext, err)
 		}
 		sum256 := sha256.Sum256(payload)
-		r.Body = ioutil.NopCloser(bytes.NewReader(payload))
+		r.Body = io.NopCloser(bytes.NewReader(payload))
 		return hex.EncodeToString(sum256[:])
 	}
 
@@ -142,26 +146,26 @@ func isValidRegion(reqRegion string, confRegion string) bool {
 // check if the access key is valid and recognized, additionally
 // also returns if the access key is owner/admin.
 func checkKeyValid(r *http.Request, accessKey string) (auth.Credentials, bool, APIErrorCode) {
-	if !globalIAMSys.Initialized() && !globalIsGateway {
-		// Check if server has initialized, then only proceed
-		// to check for IAM users otherwise its okay for clients
-		// to retry with 503 errors when server is coming up.
-		return auth.Credentials{}, false, ErrServerNotInitialized
-	}
-
 	cred := globalActiveCred
 	if cred.AccessKey != accessKey {
+		if !globalIAMSys.Initialized() {
+			// Check if server has initialized, then only proceed
+			// to check for IAM users otherwise its okay for clients
+			// to retry with 503 errors when server is coming up.
+			return auth.Credentials{}, false, ErrServerNotInitialized
+		}
+
 		// Check if the access key is part of users credentials.
-		ucred, ok := globalIAMSys.GetUser(r.Context(), accessKey)
+		u, ok := globalIAMSys.GetUser(r.Context(), accessKey)
 		if !ok {
 			// Credentials will be invalid but and disabled
 			// return a different error in such a scenario.
-			if ucred.Status == auth.AccountOff {
+			if u.Credentials.Status == auth.AccountOff {
 				return cred, false, ErrAccessKeyDisabled
 			}
 			return cred, false, ErrInvalidAccessKeyID
 		}
-		cred = ucred
+		cred = u.Credentials
 	}
 
 	claims, s3Err := checkClaimsFromToken(r, cred)
@@ -170,7 +174,16 @@ func checkKeyValid(r *http.Request, accessKey string) (auth.Credentials, bool, A
 	}
 	cred.Claims = claims
 
-	owner := cred.AccessKey == globalActiveCred.AccessKey
+	owner := cred.AccessKey == globalActiveCred.AccessKey || (cred.ParentUser == globalActiveCred.AccessKey && cred.AccessKey != siteReplicatorSvcAcc)
+	if owner && !globalAPIConfig.permitRootAccess() {
+		// We disable root access and its service accounts if asked for.
+		return cred, owner, ErrAccessKeyDisabled
+	}
+
+	if _, ok := claims[iampolicy.SessionPolicyName]; ok {
+		owner = false
+	}
+
 	return cred, owner, ErrNone
 }
 
@@ -187,7 +200,7 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request) (http.Header,
 	reqQueries := r.Form
 	// find whether "host" is part of list of signed headers.
 	// if not return ErrUnsignedHeaders. "host" is mandatory.
-	if !contains(signedHeaders, "host") {
+	if !slices.Contains(signedHeaders, "host") {
 		return nil, ErrUnsignedHeaders
 	}
 	extractedSignedHeaders := make(http.Header)

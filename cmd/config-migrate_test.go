@@ -18,17 +18,18 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
-
-	"github.com/minio/minio/internal/config"
 )
 
 // Test if config v1 is purged
 func TestServerConfigMigrateV1(t *testing.T) {
-	objLayer, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	objLayer, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,11 +38,7 @@ func TestServerConfigMigrateV1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Init Test config failed")
 	}
-	rootPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootPath)
+	rootPath := t.TempDir()
 	globalConfigDir = &ConfigDir{path: rootPath}
 
 	globalObjLayerMutex.Lock()
@@ -51,7 +48,7 @@ func TestServerConfigMigrateV1(t *testing.T) {
 	// Create a V1 config json file and store it
 	configJSON := "{ \"version\":\"1\", \"accessKeyId\":\"abcde\", \"secretAccessKey\":\"abcdefgh\"}"
 	configPath := rootPath + "/fsUsers.json"
-	if err := ioutil.WriteFile(configPath, []byte(configJSON), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o644); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
 
@@ -66,7 +63,7 @@ func TestServerConfigMigrateV1(t *testing.T) {
 	}
 
 	// Initialize server config and check again if everything is fine
-	if err := loadConfig(objLayer); err != nil {
+	if err := loadConfig(objLayer, nil); err != nil {
 		t.Fatalf("Unable to initialize from updated config file %s", err)
 	}
 }
@@ -74,13 +71,7 @@ func TestServerConfigMigrateV1(t *testing.T) {
 // Test if all migrate code returns nil when config file does not
 // exist
 func TestServerConfigMigrateInexistentConfig(t *testing.T) {
-	rootPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootPath)
-
-	globalConfigDir = &ConfigDir{path: rootPath}
+	globalConfigDir = &ConfigDir{path: t.TempDir()}
 
 	if err := migrateV2ToV3(); err != nil {
 		t.Fatal("migrate v2 to v3 should succeed when no config file is found")
@@ -164,15 +155,13 @@ func TestServerConfigMigrateInexistentConfig(t *testing.T) {
 
 // Test if a config migration from v2 to v33 is successfully done
 func TestServerConfigMigrateV2toV33(t *testing.T) {
-	rootPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootPath)
+	rootPath := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	globalConfigDir = &ConfigDir{path: rootPath}
 
-	objLayer, fsDir, err := prepareFS()
+	objLayer, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +170,7 @@ func TestServerConfigMigrateV2toV33(t *testing.T) {
 	configPath := rootPath + SlashSeparator + minioConfigFile
 
 	// Create a corrupted config file
-	if err := ioutil.WriteFile(configPath, []byte("{ \"version\":\"2\","), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte("{ \"version\":\"2\","), 0o644); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
 	// Fire a migrateConfig()
@@ -194,7 +183,7 @@ func TestServerConfigMigrateV2toV33(t *testing.T) {
 
 	// Create a V2 config json file and store it
 	configJSON := "{ \"version\":\"2\", \"credentials\": {\"accessKeyId\":\"" + accessKey + "\", \"secretAccessKey\":\"" + secretKey + "\", \"region\":\"us-east-1\"}, \"mongoLogger\":{\"addr\":\"127.0.0.1:3543\", \"db\":\"foodb\", \"collection\":\"foo\"}, \"syslogLogger\":{\"network\":\"127.0.0.1:543\", \"addr\":\"addr\"}, \"fileLogger\":{\"filename\":\"log.out\"}}"
-	if err := ioutil.WriteFile(configPath, []byte(configJSON), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o644); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
 
@@ -207,44 +196,30 @@ func TestServerConfigMigrateV2toV33(t *testing.T) {
 		t.Fatal("Unexpected error: ", err)
 	}
 
-	if err := migrateMinioSysConfig(objLayer); err != nil {
+	srvCfg, err := readConfigWithoutMigrate(context.Background(), objLayer)
+	if err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
 
-	if err := migrateMinioSysConfigToKV(objLayer); err != nil {
+	if err = saveServerConfig(GlobalContext, objLayer, srvCfg); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
 
 	// Initialize server config and check again if everything is fine
-	if err := loadConfig(objLayer); err != nil {
+	if err := loadConfig(objLayer, nil); err != nil {
 		t.Fatalf("Unable to initialize from updated config file %s", err)
-	}
-
-	// Check if accessKey and secretKey are not altered during migration
-	caccessKey := globalServerConfig[config.CredentialsSubSys][config.Default].Get(config.AccessKey)
-	if caccessKey != accessKey {
-		t.Fatalf("Access key lost during migration, expected: %v, found:%v", accessKey, caccessKey)
-	}
-
-	csecretKey := globalServerConfig[config.CredentialsSubSys][config.Default].Get(config.SecretKey)
-	if csecretKey != secretKey {
-		t.Fatalf("Secret key lost during migration, expected: %v, found: %v", secretKey, csecretKey)
 	}
 }
 
 // Test if all migrate code returns error with corrupted config files
 func TestServerConfigMigrateFaultyConfig(t *testing.T) {
-	rootPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootPath)
+	rootPath := t.TempDir()
 
 	globalConfigDir = &ConfigDir{path: rootPath}
 	configPath := rootPath + SlashSeparator + minioConfigFile
 
 	// Create a corrupted config file
-	if err := ioutil.WriteFile(configPath, []byte("{ \"version\":\"2\", \"test\":"), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte("{ \"version\":\"2\", \"test\":"), 0o644); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
 
@@ -331,35 +306,31 @@ func TestServerConfigMigrateFaultyConfig(t *testing.T) {
 
 // Test if all migrate code returns error with corrupted config files
 func TestServerConfigMigrateCorruptedConfig(t *testing.T) {
-	rootPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootPath)
+	rootPath := t.TempDir()
 
 	globalConfigDir = &ConfigDir{path: rootPath}
 	configPath := rootPath + SlashSeparator + minioConfigFile
 
 	for i := 3; i <= 17; i++ {
 		// Create a corrupted config file
-		if err = ioutil.WriteFile(configPath, []byte(fmt.Sprintf("{ \"version\":\"%d\", \"credential\": { \"accessKey\": 1 } }", i)),
+		if err := os.WriteFile(configPath, []byte(fmt.Sprintf("{ \"version\":\"%d\", \"credential\": { \"accessKey\": 1 } }", i)),
 			0o644); err != nil {
 			t.Fatal("Unexpected error: ", err)
 		}
 
 		// Test different migrate versions and be sure they are returning an error
-		if err = migrateConfig(); err == nil {
+		if err := migrateConfig(); err == nil {
 			t.Fatal("migrateConfig() should fail with a corrupted json")
 		}
 	}
 
 	// Create a corrupted config file for version '2'.
-	if err = ioutil.WriteFile(configPath, []byte("{ \"version\":\"2\", \"credentials\": { \"accessKeyId\": 1 } }"), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte("{ \"version\":\"2\", \"credentials\": { \"accessKeyId\": 1 } }"), 0o644); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
 
 	// Test different migrate versions and be sure they are returning an error
-	if err = migrateConfig(); err == nil {
+	if err := migrateConfig(); err == nil {
 		t.Fatal("migrateConfig() should fail with a corrupted json")
 	}
 }

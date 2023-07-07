@@ -23,23 +23,24 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"reflect"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/pkg/bucket/policy"
 )
 
-// API suite container common to both FS and Erasure.
+// API suite container common to both ErasureSD and Erasure.
 type TestSuiteCommon struct {
 	serverType string
 	testServer TestServer
@@ -58,13 +59,15 @@ type check struct {
 
 // Assert - checks if gotValue is same as expectedValue, if not fails the test.
 func (c *check) Assert(gotValue interface{}, expectedValue interface{}) {
+	c.Helper()
 	if !reflect.DeepEqual(gotValue, expectedValue) {
-		c.Fatalf("Test %s:%s expected %v, got %v", getSource(2), c.testType, expectedValue, gotValue)
+		c.Fatalf("Test %s expected %v, got %v", c.testType, expectedValue, gotValue)
 	}
 }
 
 func verifyError(c *check, response *http.Response, code, description string, statusCode int) {
-	data, err := ioutil.ReadAll(response.Body)
+	c.Helper()
+	data, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	errorResponse := APIErrorResponse{}
 	err = xml.Unmarshal(data, &errorResponse)
@@ -102,6 +105,7 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
 	suite.TestContentTypePersists(c)
 	suite.TestPartialContent(c)
 	suite.TestListObjectsHandler(c)
+	suite.TestListObjectVersionsOutputOrderHandler(c)
 	suite.TestListObjectsHandlerErrors(c)
 	suite.TestPutBucketErrors(c)
 	suite.TestGetObjectLarge10MiB(c)
@@ -122,12 +126,12 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
 
 func TestServerSuite(t *testing.T) {
 	testCases := []*TestSuiteCommon{
-		// Init and run test on FS backend with signature v4.
-		{serverType: "FS", signer: signerV4},
-		// Init and run test on FS backend with signature v2.
-		{serverType: "FS", signer: signerV2},
-		// Init and run test on FS backend, with tls enabled.
-		{serverType: "FS", signer: signerV4, secure: true},
+		// Init and run test on ErasureSD backend with signature v4.
+		{serverType: "ErasureSD", signer: signerV4},
+		// Init and run test on ErasureSD backend with signature v2.
+		{serverType: "ErasureSD", signer: signerV2},
+		// Init and run test on ErasureSD backend, with tls enabled.
+		{serverType: "ErasureSD", signer: signerV4, secure: true},
 		// Init and run test on Erasure backend.
 		{serverType: "Erasure", signer: signerV4},
 		// Init and run test on ErasureSet backend.
@@ -383,7 +387,7 @@ func (s *TestSuiteCommon) TestBucketPolicy(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	bucketPolicyReadBuf, err := ioutil.ReadAll(response.Body)
+	bucketPolicyReadBuf, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	// Verify if downloaded policy matches with previously uploaded.
 	expectedPolicy, err := policy.ParseConfig(strings.NewReader(bucketPolicyStr), bucketName)
@@ -592,7 +596,7 @@ func (s *TestSuiteCommon) TestDeleteMultipleObjects(c *check) {
 	c.Assert(response.StatusCode, http.StatusOK)
 
 	deleteResp := DeleteObjectsResponse{}
-	delRespBytes, err := ioutil.ReadAll(response.Body)
+	delRespBytes, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	err = xml.Unmarshal(delRespBytes, &deleteResp)
 	c.Assert(err, nil)
@@ -615,7 +619,7 @@ func (s *TestSuiteCommon) TestDeleteMultipleObjects(c *check) {
 	c.Assert(response.StatusCode, http.StatusOK)
 
 	deleteResp = DeleteObjectsResponse{}
-	delRespBytes, err = ioutil.ReadAll(response.Body)
+	delRespBytes, err = io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	err = xml.Unmarshal(delRespBytes, &deleteResp)
 	c.Assert(err, nil)
@@ -755,7 +759,7 @@ func (s *TestSuiteCommon) TestEmptyObject(c *check) {
 
 	var buffer bytes.Buffer
 	// extract the body of the response.
-	responseBody, err := ioutil.ReadAll(response.Body)
+	responseBody, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	// assert the http response body content.
 	c.Assert(true, bytes.Equal(responseBody, buffer.Bytes()))
@@ -876,7 +880,7 @@ func (s *TestSuiteCommon) TestMultipleObjects(c *check) {
 	c.Assert(response.StatusCode, http.StatusOK)
 
 	// extract the response body.
-	responseBody, err := ioutil.ReadAll(response.Body)
+	responseBody, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	// assert the content body for the expected object data.
 	c.Assert(true, bytes.Equal(responseBody, []byte("hello one")))
@@ -905,7 +909,7 @@ func (s *TestSuiteCommon) TestMultipleObjects(c *check) {
 	c.Assert(response.StatusCode, http.StatusOK)
 
 	// verify response data
-	responseBody, err = ioutil.ReadAll(response.Body)
+	responseBody, err = io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	c.Assert(true, bytes.Equal(responseBody, []byte("hello two")))
 
@@ -932,7 +936,7 @@ func (s *TestSuiteCommon) TestMultipleObjects(c *check) {
 	c.Assert(response.StatusCode, http.StatusOK)
 
 	// verify object.
-	responseBody, err = ioutil.ReadAll(response.Body)
+	responseBody, err = io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	c.Assert(true, bytes.Equal(responseBody, []byte("hello three")))
 }
@@ -1058,7 +1062,7 @@ func (s *TestSuiteCommon) TestCopyObject(c *check) {
 	c.Assert(response.StatusCode, http.StatusOK)
 	// reading the response body.
 	// response body is expected to have the copied content of the first uploaded object.
-	object, err := ioutil.ReadAll(response.Body)
+	object, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 	c.Assert(string(object), "hello world")
 }
@@ -1232,7 +1236,7 @@ func (s *TestSuiteCommon) TestSHA256Mismatch(c *check) {
 	// Set the body to generate signature mismatch.
 	helloReader := bytes.NewReader([]byte("Hello, World"))
 	request.ContentLength = helloReader.Size()
-	request.Body = ioutil.NopCloser(helloReader)
+	request.Body = io.NopCloser(helloReader)
 	c.Assert(err, nil)
 
 	// execute the HTTP request.
@@ -1561,7 +1565,7 @@ func (s *TestSuiteCommon) TestPartialContent(c *check) {
 	response, err = s.client.Do(request)
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusPartialContent)
-	partialObject, err := ioutil.ReadAll(response.Body)
+	partialObject, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 
 	c.Assert(string(partialObject), "Wo")
@@ -1604,7 +1608,6 @@ func (s *TestSuiteCommon) TestListObjectsHandler(c *check) {
 			[]string{
 				"<Key>foo bar 1</Key>",
 				"<Key>foo bar 2</Key>",
-				fmt.Sprintf("<Owner><ID>%s</ID><DisplayName>minio</DisplayName></Owner>", globalMinioDefaultOwnerID),
 			},
 		},
 		{
@@ -1627,7 +1630,146 @@ func (s *TestSuiteCommon) TestListObjectsHandler(c *check) {
 		c.Assert(err, nil)
 		c.Assert(response.StatusCode, http.StatusOK)
 
-		getContent, err := ioutil.ReadAll(response.Body)
+		getContent, err := io.ReadAll(response.Body)
+		c.Assert(err, nil)
+
+		for _, expectedStr := range testCase.expectedStrings {
+			c.Assert(strings.Contains(string(getContent), expectedStr), true)
+		}
+	}
+}
+
+// TestListObjectVersionsHandler - checks the order of <Version>
+// and <DeleteMarker> XML tags in a version listing
+func (s *TestSuiteCommon) TestListObjectVersionsOutputOrderHandler(c *check) {
+	// generate a random bucket name.
+	bucketName := getRandomBucketName()
+	// HTTP request to create the bucket.
+	makeBucketRequest, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+	// execute the HTTP request to create bucket.
+	response, err := s.client.Do(makeBucketRequest)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	// HTTP request to create the bucket.
+	enableVersioningBody := []byte("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+	enableVersioningBucketRequest, err := newTestSignedRequest(http.MethodPut, getBucketVersioningConfigURL(s.endPoint, bucketName),
+		int64(len(enableVersioningBody)), bytes.NewReader(enableVersioningBody), s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+	// execute the HTTP request to create bucket.
+	response, err = s.client.Do(enableVersioningBucketRequest)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	for _, objectName := range []string{"file.1", "file.2"} {
+		buffer := bytes.NewReader([]byte("testcontent"))
+		putRequest, err := newTestSignedRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, objectName),
+			int64(buffer.Len()), buffer, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+		response, err = s.client.Do(putRequest)
+		c.Assert(err, nil)
+		c.Assert(response.StatusCode, http.StatusOK)
+
+		delRequest, err := newTestSignedRequest(http.MethodDelete, getDeleteObjectURL(s.endPoint, bucketName, objectName),
+			0, nil, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+		response, err = s.client.Do(delRequest)
+		c.Assert(err, nil)
+		c.Assert(response.StatusCode, http.StatusNoContent)
+	}
+
+	// create listObjectsV1 request with valid parameters
+	request, err := newTestSignedRequest(http.MethodGet, getListObjectVersionsURL(s.endPoint, bucketName, "", "1000", ""),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+	// execute the HTTP request.
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	getContent, err := io.ReadAll(response.Body)
+	c.Assert(err, nil)
+
+	r := regexp.MustCompile(
+		`<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">.*` +
+			`<DeleteMarker><Key>file.1</Key>.*<IsLatest>true</IsLatest>.*</DeleteMarker>` +
+			`<Version><Key>file.1</Key>.*<IsLatest>false</IsLatest>.*</Version>` +
+			`<DeleteMarker><Key>file.2</Key>.*<IsLatest>true</IsLatest>.*</DeleteMarker>` +
+			`<Version><Key>file.2</Key>.*<IsLatest>false</IsLatest>.*</Version>` +
+			`</ListVersionsResult>`)
+
+	c.Assert(r.MatchString(string(getContent)), true)
+}
+
+// TestListObjectsSpecialCharactersHandler - Setting valid parameters to List Objects
+// and then asserting the response with the expected one.
+func (s *TestSuiteCommon) TestListObjectsSpecialCharactersHandler(c *check) {
+	if runtime.GOOS == globalWindowsOSName {
+		c.Skip("skip special character test for windows")
+	}
+
+	// generate a random bucket name.
+	bucketName := getRandomBucketName()
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	// execute the HTTP request to create bucket.
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	for _, objectName := range []string{"foo bar 1", "foo bar 2", "foo \x01 bar"} {
+		buffer := bytes.NewReader([]byte("Hello World"))
+		request, err = newTestSignedRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, objectName),
+			int64(buffer.Len()), buffer, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+
+		response, err = s.client.Do(request)
+		c.Assert(err, nil)
+		c.Assert(response.StatusCode, http.StatusOK)
+	}
+
+	testCases := []struct {
+		getURL          string
+		expectedStrings []string
+	}{
+		{getListObjectsV1URL(s.endPoint, bucketName, "", "1000", ""), []string{"<Key>foo bar 1</Key>", "<Key>foo bar 2</Key>", "<Key>foo &#x1; bar</Key>"}},
+		{getListObjectsV1URL(s.endPoint, bucketName, "", "1000", "url"), []string{"<Key>foo+bar+1</Key>", "<Key>foo+bar+2</Key>", "<Key>foo+%01+bar</Key>"}},
+		{
+			getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "", ""),
+			[]string{
+				"<Key>foo bar 1</Key>",
+				"<Key>foo bar 2</Key>",
+				"<Key>foo &#x1; bar</Key>",
+				fmt.Sprintf("<Owner><ID>%s</ID><DisplayName>minio</DisplayName></Owner>", globalMinioDefaultOwnerID),
+			},
+		},
+		{
+			getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "true", ""),
+			[]string{
+				"<Key>foo bar 1</Key>",
+				"<Key>foo bar 2</Key>",
+				"<Key>foo &#x1; bar</Key>",
+				fmt.Sprintf("<Owner><ID>%s</ID><DisplayName>minio</DisplayName></Owner>", globalMinioDefaultOwnerID),
+			},
+		},
+		{getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "", "url"), []string{"<Key>foo+bar+1</Key>", "<Key>foo+bar+2</Key>", "<Key>foo+%01+bar</Key>"}},
+	}
+
+	for _, testCase := range testCases {
+		// create listObjectsV1 request with valid parameters
+		request, err = newTestSignedRequest(http.MethodGet, testCase.getURL, 0, nil, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+		// execute the HTTP request.
+		response, err = s.client.Do(request)
+		c.Assert(err, nil)
+		c.Assert(response.StatusCode, http.StatusOK)
+
+		getContent, err := io.ReadAll(response.Body)
 		c.Assert(err, nil)
 
 		for _, expectedStr := range testCase.expectedStrings {
@@ -1761,7 +1903,7 @@ func (s *TestSuiteCommon) TestGetObjectLarge10MiB(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 	// extract the content from response body.
-	getContent, err := ioutil.ReadAll(response.Body)
+	getContent, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 
 	// Compare putContent and getContent.
@@ -1822,7 +1964,7 @@ func (s *TestSuiteCommon) TestGetObjectLarge11MiB(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 	// fetch the content from response body.
-	getContent, err := ioutil.ReadAll(response.Body)
+	getContent, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 
 	// Get etag of the response content.
@@ -1910,7 +2052,7 @@ func (s *TestSuiteCommon) TestGetPartialObjectMisAligned(c *check) {
 		// Since only part of the object is requested, expecting response status to be http.StatusPartialContent .
 		c.Assert(response.StatusCode, http.StatusPartialContent)
 		// parse the HTTP response body.
-		getContent, err := ioutil.ReadAll(response.Body)
+		getContent, err := io.ReadAll(response.Body)
 		c.Assert(err, nil)
 
 		// Compare putContent and getContent.
@@ -1976,7 +2118,7 @@ func (s *TestSuiteCommon) TestGetPartialObjectLarge11MiB(c *check) {
 	// Since only part of the object is requested, expecting response status to be http.StatusPartialContent .
 	c.Assert(response.StatusCode, http.StatusPartialContent)
 	// read the downloaded content from the response body.
-	getContent, err := ioutil.ReadAll(response.Body)
+	getContent, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 
 	// Compare putContent and getContent.
@@ -2043,7 +2185,7 @@ func (s *TestSuiteCommon) TestGetPartialObjectLarge10MiB(c *check) {
 	// Since only part of the object is requested, expecting response status to be http.StatusPartialContent .
 	c.Assert(response.StatusCode, http.StatusPartialContent)
 	// read the downloaded content from the response body.
-	getContent, err := ioutil.ReadAll(response.Body)
+	getContent, err := io.ReadAll(response.Body)
 	c.Assert(err, nil)
 
 	// Compare putContent and getContent.

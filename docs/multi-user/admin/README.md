@@ -8,12 +8,12 @@ In this document we will explain in detail on how to configure admin users.
 
 ### 1. Prerequisites
 
-- Install mc - [MinIO Client Quickstart Guide](https://docs.min.io/docs/minio-client-quickstart-guide.html)
-- Install MinIO - [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide)
+- Install mc - [MinIO Client Quickstart Guide](https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart)
+- Install MinIO - [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#quickstart-for-linux)
 
 ### 2. Create a new admin user with CreateUser, DeleteUser and ConfigUpdate permissions
 
-Use [`mc admin policy`](https://docs.min.io/docs/minio-admin-complete-guide.html#policies) to create custom admin policies.
+Use [`mc admin policy`](https://min.io/docs/minio/linux/reference/minio-mc-admin/mc-admin-policy.html#command-mc.admin.policy) to create custom admin policies.
 
 Create new canned policy file `adminManageUser.json`. This policy enables admin user to
 manage other users.
@@ -50,7 +50,7 @@ EOF
 Create new canned policy by name `userManager` using `userManager.json` policy file.
 
 ```
-mc admin policy add myminio userManager adminManageUser.json
+mc admin policy attach myminio userManager adminManageUser.json
 ```
 
 Create a new admin user `admin1` on MinIO use `mc admin user`.
@@ -62,7 +62,7 @@ mc admin user add myminio admin1 admin123
 Once the user is successfully created you can now apply the `userManage` policy for this user.
 
 ```
-mc admin policy set myminio userManager user=admin1
+mc admin policy attach myminio userManager --user=admin1
 ```
 
 This admin user will then be allowed to perform create/delete user operations via `mc admin user`
@@ -73,8 +73,8 @@ This admin user will then be allowed to perform create/delete user operations vi
 mc alias set myminio-admin1 http://localhost:9000 admin1 admin123 --api s3v4
 
 mc admin user add myminio-admin1 user1 user123
-mc admin policy add myminio-admin1 user1policy ~/user1policy.json
-mc admin policy set myminio-admin1 user1policy user=user1
+mc admin policy attach myminio-admin1 user1policy ~/user1policy.json
+mc admin policy attach myminio-admin1 user1policy --user=user1
 ```
 
 ### 4. List of permissions defined for admin operations
@@ -162,11 +162,11 @@ mc admin policy set myminio-admin1 user1policy user=user1
 ### 5. Using an external IDP for admin users
 
 Admin users can also be externally managed by an IDP by configuring admin policy with
-special permissions listed above. Follow [MinIO STS Quickstart Guide](https://docs.min.io/docs/minio-sts-quickstart-guide) to manage users with an IDP.
+special permissions listed above. Follow [MinIO STS Quickstart Guide](https://min.io/docs/minio/linux/developers/security-token-service.html) to manage users with an IDP.
 
 ## Explore Further
 
-- [MinIO Client Complete Guide](https://docs.min.io/docs/minio-client-complete-guide)
-- [MinIO STS Quickstart Guide](https://docs.min.io/docs/minio-sts-quickstart-guide)
-- [MinIO Admin Complete Guide](https://docs.min.io/docs/minio-admin-complete-guide.html)
-- [The MinIO documentation website](https://docs.min.io)
+- [MinIO Client Complete Guide](https://min.io/docs/minio/linux/reference/minio-mc.html)
+- [MinIO STS Quickstart Guide](https://min.io/docs/minio/linux/developers/security-token-service.html)
+- [MinIO Admin Complete Guide](https://min.io/docs/minio/linux/reference/minio-mc-admin.html)
+- [The MinIO documentation website](https://min.io/docs/minio/linux/index.html)

@@ -17,6 +17,10 @@
 
 package event
 
+import (
+	"github.com/minio/madmin-go/v3"
+)
+
 const (
 	// NamespaceFormat - namespace log format used in some event targets.
 	NamespaceFormat = "namespace"
@@ -26,6 +30,9 @@ const (
 
 	// AMZTimeFormat - event time format.
 	AMZTimeFormat = "2006-01-02T15:04:05.000Z"
+
+	// StoreExtension - file extension of an event file in store
+	StoreExtension = ".event"
 )
 
 // Identity represents access key who caused the event.
@@ -79,6 +86,12 @@ type Event struct {
 	ResponseElements  map[string]string `json:"responseElements"`
 	S3                Metadata          `json:"s3"`
 	Source            Source            `json:"source"`
+	Type              madmin.TraceType  `json:"-"`
+}
+
+// Mask returns the type as mask.
+func (e Event) Mask() uint64 {
+	return e.EventName.Mask()
 }
 
 // Log represents event information for some event targets.

@@ -18,8 +18,7 @@
 package cmd
 
 import (
-	"bytes"
-	"io"
+	"context"
 	"net"
 	"net/http"
 	"reflect"
@@ -29,68 +28,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/handlers"
-	"github.com/minio/minio/internal/logger"
+	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/mcontext"
 )
-
-// recordRequest - records the first recLen bytes
-// of a given io.Reader
-type recordRequest struct {
-	// Data source to record
-	io.Reader
-	// Response body should be logged
-	logBody bool
-	// Internal recording buffer
-	buf bytes.Buffer
-	// request headers
-	headers http.Header
-	// total bytes read including header size
-	bytesRead int
-}
-
-func (r *recordRequest) Close() error {
-	// no-op
-	return nil
-}
-
-func (r *recordRequest) Read(p []byte) (n int, err error) {
-	n, err = r.Reader.Read(p)
-	r.bytesRead += n
-
-	if r.logBody {
-		r.buf.Write(p[:n])
-	}
-	if err != nil {
-		return n, err
-	}
-	return n, err
-}
-
-func (r *recordRequest) Size() int {
-	sz := r.bytesRead
-	for k, v := range r.headers {
-		sz += len(k) + len(v)
-	}
-	return sz
-}
-
-// Return the bytes that were recorded.
-func (r *recordRequest) Data() []byte {
-	// If body logging is enabled then we return the actual body
-	if r.logBody {
-		return r.buf.Bytes()
-	}
-	// ... otherwise we return <BODY> placeholder
-	return logger.BodyPlaceHolder
-}
 
 var ldapPwdRegex = regexp.MustCompile("(^.*?)LDAPPassword=([^&]*?)(&(.*?))?$")
 
 // redact LDAP password if part of string
 func redactLDAPPwd(s string) string {
 	parts := ldapPwdRegex.FindStringSubmatch(s)
-	if len(parts) > 0 {
+	if len(parts) > 3 {
 		return parts[1] + "LDAPPassword=*REDACTED*" + parts[3]
 	}
 	return s
@@ -102,96 +51,148 @@ func getOpName(name string) (op string) {
 	op = strings.TrimSuffix(op, "Handler-fm")
 	op = strings.Replace(op, "objectAPIHandlers", "s3", 1)
 	op = strings.Replace(op, "adminAPIHandlers", "admin", 1)
-	op = strings.Replace(op, "(*webAPIHandlers)", "web", 1)
-	op = strings.Replace(op, "(*storageRESTServer)", "internal", 1)
-	op = strings.Replace(op, "(*peerRESTServer)", "internal", 1)
-	op = strings.Replace(op, "(*lockRESTServer)", "internal", 1)
+	op = strings.Replace(op, "(*storageRESTServer)", "storageR", 1)
+	op = strings.Replace(op, "(*peerRESTServer)", "peer", 1)
+	op = strings.Replace(op, "(*lockRESTServer)", "lockR", 1)
 	op = strings.Replace(op, "(*stsAPIHandlers)", "sts", 1)
-	op = strings.Replace(op, "LivenessCheckHandler", "healthcheck", 1)
-	op = strings.Replace(op, "ReadinessCheckHandler", "healthcheck", 1)
+	op = strings.Replace(op, "ClusterCheckHandler", "health.Cluster", 1)
+	op = strings.Replace(op, "ClusterReadCheckHandler", "health.ClusterRead", 1)
+	op = strings.Replace(op, "LivenessCheckHandler", "health.Liveness", 1)
+	op = strings.Replace(op, "ReadinessCheckHandler", "health.Readiness", 1)
 	op = strings.Replace(op, "-fm", "", 1)
 	return op
 }
 
-// Trace gets trace of http request
-func Trace(f http.HandlerFunc, logBody bool, w http.ResponseWriter, r *http.Request) madmin.TraceInfo {
-	name := getOpName(runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name())
+// If trace is enabled, execute the request if it is traced by other handlers
+// otherwise, generate a trace event with request information but no response.
+func httpTracer(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Setup a http request response recorder - this is needed for
+		// http stats requests and audit if enabled.
+		respRecorder := xhttp.NewResponseRecorder(w)
 
-	// Setup a http request body recorder
-	reqHeaders := r.Header.Clone()
-	reqHeaders.Set("Host", r.Host)
-	if len(r.TransferEncoding) == 0 {
-		reqHeaders.Set("Content-Length", strconv.Itoa(int(r.ContentLength)))
-	} else {
-		reqHeaders.Set("Transfer-Encoding", strings.Join(r.TransferEncoding, ","))
-	}
+		// Setup a http request body recorder
+		reqRecorder := &xhttp.RequestRecorder{Reader: r.Body}
+		r.Body = reqRecorder
 
-	reqBodyRecorder := &recordRequest{Reader: r.Body, logBody: logBody, headers: reqHeaders}
-	r.Body = reqBodyRecorder
-
-	now := time.Now().UTC()
-	t := madmin.TraceInfo{TraceType: madmin.TraceHTTP, FuncName: name, Time: now}
-
-	t.NodeName = r.Host
-	if globalIsDistErasure {
-		t.NodeName = globalLocalNodeName
-	}
-
-	if t.NodeName == "" {
-		t.NodeName = globalLocalNodeName
-	}
-
-	// strip only standard port from the host address
-	if host, port, err := net.SplitHostPort(t.NodeName); err == nil {
-		if port == "443" || port == "80" {
-			t.NodeName = host
+		// Create tracing data structure and associate it to the request context
+		tc := mcontext.TraceCtxt{
+			AmzReqID:         r.Header.Get(xhttp.AmzRequestID),
+			RequestRecorder:  reqRecorder,
+			ResponseRecorder: respRecorder,
 		}
+
+		r = r.WithContext(context.WithValue(r.Context(), mcontext.ContextTraceKey, &tc))
+
+		reqStartTime := time.Now().UTC()
+		h.ServeHTTP(respRecorder, r)
+		reqEndTime := time.Now().UTC()
+
+		if globalTrace.NumSubscribers(madmin.TraceS3|madmin.TraceInternal) == 0 {
+			// no subscribers nothing to trace.
+			return
+		}
+
+		tt := madmin.TraceInternal
+		if strings.HasPrefix(tc.FuncName, "s3.") {
+			tt = madmin.TraceS3
+		}
+
+		// Calculate input body size with headers
+		reqHeaders := r.Header.Clone()
+		reqHeaders.Set("Host", r.Host)
+		if len(r.TransferEncoding) == 0 {
+			reqHeaders.Set("Content-Length", strconv.Itoa(int(r.ContentLength)))
+		} else {
+			reqHeaders.Set("Transfer-Encoding", strings.Join(r.TransferEncoding, ","))
+		}
+		inputBytes := reqRecorder.Size()
+		for k, v := range reqHeaders {
+			inputBytes += len(k) + len(v)
+		}
+
+		// Calculate node name
+		nodeName := r.Host
+		if globalIsDistErasure {
+			nodeName = globalLocalNodeName
+		}
+		if host, port, err := net.SplitHostPort(nodeName); err == nil {
+			if port == "443" || port == "80" {
+				nodeName = host
+			}
+		}
+
+		// Calculate reqPath
+		reqPath := r.URL.RawPath
+		if reqPath == "" {
+			reqPath = r.URL.Path
+		}
+
+		// Calculate function name
+		funcName := tc.FuncName
+		if funcName == "" {
+			funcName = "<unknown>"
+		}
+
+		t := madmin.TraceInfo{
+			TraceType: tt,
+			FuncName:  funcName,
+			NodeName:  nodeName,
+			Time:      reqStartTime,
+			Duration:  reqEndTime.Sub(respRecorder.StartTime),
+			Path:      reqPath,
+			HTTP: &madmin.TraceHTTPStats{
+				ReqInfo: madmin.TraceRequestInfo{
+					Time:     reqStartTime,
+					Proto:    r.Proto,
+					Method:   r.Method,
+					RawQuery: redactLDAPPwd(r.URL.RawQuery),
+					Client:   handlers.GetSourceIP(r),
+					Headers:  reqHeaders,
+					Path:     reqPath,
+					Body:     reqRecorder.Data(),
+				},
+				RespInfo: madmin.TraceResponseInfo{
+					Time:       reqEndTime,
+					Headers:    respRecorder.Header().Clone(),
+					StatusCode: respRecorder.StatusCode,
+					Body:       respRecorder.Body(),
+				},
+				CallStats: madmin.TraceCallStats{
+					Latency:         reqEndTime.Sub(respRecorder.StartTime),
+					InputBytes:      inputBytes,
+					OutputBytes:     respRecorder.Size(),
+					TimeToFirstByte: respRecorder.TimeToFirstByte,
+				},
+			},
+		}
+
+		globalTrace.Publish(t)
+	})
+}
+
+func httpTrace(f http.HandlerFunc, logBody bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+		if !ok {
+			// Tracing is not enabled for this request
+			f.ServeHTTP(w, r)
+			return
+		}
+
+		tc.FuncName = getOpName(runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name())
+		tc.RequestRecorder.LogBody = logBody
+		tc.ResponseRecorder.LogAllBody = logBody
+		tc.ResponseRecorder.LogErrBody = true
+
+		f.ServeHTTP(w, r)
 	}
+}
 
-	rq := madmin.TraceRequestInfo{
-		Time:     now,
-		Proto:    r.Proto,
-		Method:   r.Method,
-		RawQuery: redactLDAPPwd(r.URL.RawQuery),
-		Client:   handlers.GetSourceIP(r),
-		Headers:  reqHeaders,
-	}
+func httpTraceAll(f http.HandlerFunc) http.HandlerFunc {
+	return httpTrace(f, true)
+}
 
-	path := r.URL.RawPath
-	if path == "" {
-		path = r.URL.Path
-	}
-	rq.Path = path
-
-	rw := logger.NewResponseWriter(w)
-	rw.LogErrBody = true
-	rw.LogAllBody = logBody
-
-	// Execute call.
-	f(rw, r)
-
-	rs := madmin.TraceResponseInfo{
-		Time:       time.Now().UTC(),
-		Headers:    rw.Header().Clone(),
-		StatusCode: rw.StatusCode,
-		Body:       rw.Body(),
-	}
-
-	// Transfer request body
-	rq.Body = reqBodyRecorder.Data()
-
-	if rs.StatusCode == 0 {
-		rs.StatusCode = http.StatusOK
-	}
-
-	t.ReqInfo = rq
-	t.RespInfo = rs
-
-	t.CallStats = madmin.TraceCallStats{
-		Latency:         rs.Time.Sub(rw.StartTime),
-		InputBytes:      reqBodyRecorder.Size(),
-		OutputBytes:     rw.Size(),
-		TimeToFirstByte: rw.TimeToFirstByte,
-	}
-	return t
+func httpTraceHdrs(f http.HandlerFunc) http.HandlerFunc {
+	return httpTrace(f, false)
 }

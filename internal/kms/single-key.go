@@ -18,13 +18,14 @@
 package kms
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -32,11 +33,15 @@ import (
 	"github.com/secure-io/sio-go/sioutil"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
+
+	"github.com/minio/kes-go"
+	"github.com/minio/minio/internal/hash/sha256"
 )
 
 // Parse parses s as single-key KMS. The given string
 // is expected to have the following format:
-//  <key-id>:<base64-key>
+//
+//	<key-id>:<base64-key>
 //
 // The returned KMS implementation uses the parsed
 // key ID and key to derive new DEKs and decrypt ciphertext.
@@ -80,23 +85,57 @@ const ( // algorithms used to derive and encrypt DEKs
 	algorithmChaCha20Poly1305 = "ChaCha20Poly1305"
 )
 
-func (kms secretKey) Stat() (Status, error) {
+func (kms secretKey) Stat(context.Context) (Status, error) {
 	return Status{
 		Name:       "SecretKey",
 		DefaultKey: kms.keyID,
 	}, nil
 }
 
-func (secretKey) CreateKey(string) error {
-	return errors.New("kms: creating keys is not supported")
+// IsLocal returns true if the KMS is a local implementation
+func (kms secretKey) IsLocal() bool {
+	return true
 }
 
-func (kms secretKey) GenerateKey(keyID string, context Context) (DEK, error) {
+// List returns an array of local KMS Names
+func (kms secretKey) List() []kes.KeyInfo {
+	kmsSecret := []kes.KeyInfo{
+		{
+			Name: kms.keyID,
+		},
+	}
+	return kmsSecret
+}
+
+func (secretKey) Metrics(ctx context.Context) (kes.Metric, error) {
+	return kes.Metric{}, Error{
+		HTTPStatusCode: http.StatusNotImplemented,
+		APICode:        "KMS.NotImplemented",
+		Err:            errors.New("metrics are not supported"),
+	}
+}
+
+func (kms secretKey) CreateKey(_ context.Context, keyID string) error {
+	if keyID == kms.keyID {
+		return nil
+	}
+	return Error{
+		HTTPStatusCode: http.StatusNotImplemented,
+		APICode:        "KMS.NotImplemented",
+		Err:            fmt.Errorf("creating custom key %q is not supported", keyID),
+	}
+}
+
+func (kms secretKey) GenerateKey(_ context.Context, keyID string, context Context) (DEK, error) {
 	if keyID == "" {
 		keyID = kms.keyID
 	}
 	if keyID != kms.keyID {
-		return DEK{}, fmt.Errorf("kms: key %q does not exist", keyID)
+		return DEK{}, Error{
+			HTTPStatusCode: http.StatusBadRequest,
+			APICode:        "KMS.NotFoundException",
+			Err:            fmt.Errorf("key %q does not exist", keyID),
+		}
 	}
 	iv, err := sioutil.Random(16)
 	if err != nil {
@@ -137,7 +176,11 @@ func (kms secretKey) GenerateKey(keyID string, context Context) (DEK, error) {
 			return DEK{}, err
 		}
 	default:
-		return DEK{}, errors.New("invalid algorithm: " + algorithm)
+		return DEK{}, Error{
+			HTTPStatusCode: http.StatusBadRequest,
+			APICode:        "KMS.InternalException",
+			Err:            errors.New("invalid algorithm: " + algorithm),
+		}
 	}
 
 	nonce, err := sioutil.Random(aead.NonceSize())
@@ -171,17 +214,29 @@ func (kms secretKey) GenerateKey(keyID string, context Context) (DEK, error) {
 
 func (kms secretKey) DecryptKey(keyID string, ciphertext []byte, context Context) ([]byte, error) {
 	if keyID != kms.keyID {
-		return nil, fmt.Errorf("kms: key %q does not exist", keyID)
+		return nil, Error{
+			HTTPStatusCode: http.StatusBadRequest,
+			APICode:        "KMS.NotFoundException",
+			Err:            fmt.Errorf("key %q does not exist", keyID),
+		}
 	}
 
 	var encryptedKey encryptedKey
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err := json.Unmarshal(ciphertext, &encryptedKey); err != nil {
-		return nil, err
+		return nil, Error{
+			HTTPStatusCode: http.StatusBadRequest,
+			APICode:        "KMS.InternalException",
+			Err:            err,
+		}
 	}
 
 	if n := len(encryptedKey.IV); n != 16 {
-		return nil, fmt.Errorf("kms: invalid iv size")
+		return nil, Error{
+			HTTPStatusCode: http.StatusBadRequest,
+			APICode:        "KMS.InternalException",
+			Err:            fmt.Errorf("invalid iv size: %d", n),
+		}
 	}
 
 	var aead cipher.AEAD
@@ -209,22 +264,34 @@ func (kms secretKey) DecryptKey(keyID string, ciphertext []byte, context Context
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("kms: invalid algorithm: %q", encryptedKey.Algorithm)
+		return nil, Error{
+			HTTPStatusCode: http.StatusBadRequest,
+			APICode:        "KMS.InternalException",
+			Err:            fmt.Errorf("invalid algorithm: %q", encryptedKey.Algorithm),
+		}
 	}
 
 	if n := len(encryptedKey.Nonce); n != aead.NonceSize() {
-		return nil, fmt.Errorf("kms: invalid nonce size %d", n)
+		return nil, Error{
+			HTTPStatusCode: http.StatusBadRequest,
+			APICode:        "KMS.InternalException",
+			Err:            fmt.Errorf("invalid nonce size %d", n),
+		}
 	}
 
 	associatedData, _ := context.MarshalText()
 	plaintext, err := aead.Open(nil, encryptedKey.Nonce, encryptedKey.Bytes, associatedData)
 	if err != nil {
-		return nil, fmt.Errorf("kms: encrypted key is not authentic")
+		return nil, Error{
+			HTTPStatusCode: http.StatusBadRequest,
+			APICode:        "KMS.InternalException",
+			Err:            fmt.Errorf("encrypted key is not authentic"),
+		}
 	}
 	return plaintext, nil
 }
 
-func (kms secretKey) DecryptAll(keyID string, ciphertexts [][]byte, contexts []Context) ([][]byte, error) {
+func (kms secretKey) DecryptAll(_ context.Context, keyID string, ciphertexts [][]byte, contexts []Context) ([][]byte, error) {
 	plaintexts := make([][]byte, 0, len(ciphertexts))
 	for i := range ciphertexts {
 		plaintext, err := kms.DecryptKey(keyID, ciphertexts[i], contexts[i])

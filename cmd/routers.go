@@ -20,7 +20,7 @@ package cmd
 import (
 	"net/http"
 
-	"github.com/gorilla/mux"
+	"github.com/minio/mux"
 )
 
 // Composed function registering routers for only distributed Erasure setup.
@@ -31,6 +31,9 @@ func registerDistErasureRouters(router *mux.Router, endpointServerPools Endpoint
 	// Register peer REST router only if its a distributed setup.
 	registerPeerRESTHandlers(router)
 
+	// Register peer S3 router only if its a distributed setup.
+	registerPeerS3Handlers(router)
+
 	// Register bootstrap REST router for distributed setups.
 	registerBootstrapRESTHandlers(router)
 
@@ -40,6 +43,9 @@ func registerDistErasureRouters(router *mux.Router, endpointServerPools Endpoint
 
 // List of some generic handlers which are applied for all incoming requests.
 var globalHandlers = []mux.MiddlewareFunc{
+	// The generic tracer needs to be the first handler
+	// to catch all requests returned early by any other handler
+	httpTracer,
 	// Auth handler verifies incoming authorization headers and
 	// routes them accordingly. Client receives a HTTP error for
 	// invalid/unsupported signatures.
@@ -52,12 +58,12 @@ var globalHandlers = []mux.MiddlewareFunc{
 	setCrossDomainPolicy,
 	// Limits all body and header sizes to a maximum fixed limit
 	setRequestLimitHandler,
-	// Network statistics
-	setHTTPStatsHandler,
 	// Validate all the incoming requests.
 	setRequestValidityHandler,
 	// set x-amz-request-id header.
 	addCustomHeaders,
+	// Add upload forwarding handler for site replication
+	setUploadForwardingHandler,
 	// Add bucket forwarding handler
 	setBucketForwardingHandler,
 	// Add new handlers here.
@@ -65,7 +71,7 @@ var globalHandlers = []mux.MiddlewareFunc{
 
 // configureServer handler returns final handler for the http server.
 func configureServerHandler(endpointServerPools EndpointServerPools) (http.Handler, error) {
-	// Initialize router. `SkipClean(true)` stops gorilla/mux from
+	// Initialize router. `SkipClean(true)` stops minio/mux from
 	// normalizing URL path minio/minio#3256
 	router := mux.NewRouter().SkipClean(true).UseEncodedPath()
 
@@ -85,6 +91,9 @@ func configureServerHandler(endpointServerPools EndpointServerPools) (http.Handl
 
 	// Add STS router always.
 	registerSTSRouter(router)
+
+	// Add KMS router
+	registerKMSRouter(router)
 
 	// Add API router
 	registerAPIRouter(router)

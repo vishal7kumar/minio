@@ -2,11 +2,11 @@
 
 ## Configuration Directory
 
-MinIO stores all its config as part of the server deployment, config is erasure coded on MinIO. On a fresh deployment MinIO automatically generates a new `config` and this config is available to be configured via `mc admin config` command. MinIO also encrypts all the config, IAM and policies content if KMS is configured. Please refer to how to encrypt your config and IAM credentials [here](https://github.com/minio/minio/blob/master/docs/kms/IAM.md)
+MinIO stores all its config as part of the server deployment, config is erasure coded on MinIO. On a fresh deployment MinIO automatically generates a new `config` and this config is available to be configured via `mc admin config` command. MinIO also encrypts all the config, IAM and policies content if KMS is configured. Please refer to how to encrypt your config and IAM credentials [here](https://github.com/minio/minio/blob/master/docs/kms/IAM.md).
 
 ### Certificate Directory
 
-TLS certificates by default are expected to be stored under ``${HOME}/.minio/certs`` directory. You need to place certificates here to enable `HTTPS` based access. Read more about [How to secure access to MinIO server with TLS](https://docs.min.io/docs/how-to-secure-access-to-minio-server-with-tls).
+TLS certificates by default are expected to be stored under ``${HOME}/.minio/certs`` directory. You need to place certificates here to enable `HTTPS` based access. Read more about [How to secure access to MinIO server with TLS](https://min.io/docs/minio/linux/operations/network-encryption.html).
 
 Following is a sample directory structure for MinIO server with TLS certificates.
 
@@ -89,41 +89,9 @@ MINIO_STORAGE_CLASS_RRS       (string)    set the parity count for reduced redun
 MINIO_STORAGE_CLASS_COMMENT   (sentence)  optionally add a comment to this setting
 ```
 
-### Cache
-
-MinIO provides caching storage tier for primarily gateway deployments, allowing you to cache content for faster reads, cost savings on repeated downloads from the cloud.
-
-```
-KEY:
-cache  add caching storage tier
-
-ARGS:
-drives*  (csv)       comma separated mountpoints e.g. "/optane1,/optane2"
-expiry   (number)    cache expiry duration in days e.g. "90"
-quota    (number)    limit cache drive usage in percentage e.g. "90"
-exclude  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
-after    (number)    minimum number of access before caching an object
-comment  (sentence)  optionally add a comment to this setting
-```
-
-or environment variables
-
-```
-KEY:
-cache  add caching storage tier
-
-ARGS:
-MINIO_CACHE_DRIVES*  (csv)       comma separated mountpoints e.g. "/optane1,/optane2"
-MINIO_CACHE_EXPIRY   (number)    cache expiry duration in days e.g. "90"
-MINIO_CACHE_QUOTA    (number)    limit cache drive usage in percentage e.g. "90"
-MINIO_CACHE_EXCLUDE  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
-MINIO_CACHE_AFTER    (number)    minimum number of access before caching an object
-MINIO_CACHE_COMMENT  (sentence)  optionally add a comment to this setting
-```
-
 #### Etcd
 
-MinIO supports storing encrypted IAM assets in etcd, if KMS is configured. Please refer to how to encrypt your config and IAM credentials [here](https://github.com/minio/minio/blob/master/docs/kms/IAM.md)
+MinIO supports storing encrypted IAM assets in etcd, if KMS is configured. Please refer to how to encrypt your config and IAM credentials [here](https://github.com/minio/minio/blob/master/docs/kms/IAM.md).
 
 > NOTE: if *path_prefix* is set then MinIO will not federate your buckets, namespaced IAM assets are assumed as isolated tenants, only buckets are considered globally unique but performing a lookup with a *bucket* which belongs to a different tenant will fail unlike federated setups where MinIO would port-forward and route the request to relevant cluster accordingly. This is a special feature, federated deployments should not need to set *path_prefix*.
 
@@ -164,24 +132,40 @@ KEY:
 api  manage global HTTP API call specific features, such as throttling, authentication types, etc.
 
 ARGS:
-requests_max               (number)    set the maximum number of concurrent requests, e.g. "1600"
-requests_deadline          (duration)  set the deadline for API requests waiting to be processed e.g. "1m"
-cors_allow_origin          (csv)       set comma separated list of origins allowed for CORS requests e.g. "https://example1.com,https://example2.com"
-remote_transport_deadline  (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h"
+requests_max                    (number)    set the maximum number of concurrent requests (default: '0')
+requests_deadline               (duration)  set the deadline for API requests waiting to be processed (default: '10s')
+cluster_deadline                (duration)  set the deadline for cluster readiness check (default: '10s')
+cors_allow_origin               (csv)       set comma separated list of origins allowed for CORS requests (default: '*')
+remote_transport_deadline       (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h" (default: '2h')
+list_quorum                     (string)    set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict" (default: 'strict')
+replication_priority            (string)    set replication priority (default: 'auto')
+transition_workers              (number)    set the number of transition workers (default: '100')
+stale_uploads_expiry            (duration)  set to expire stale multipart uploads older than this values (default: '24h')
+stale_uploads_cleanup_interval  (duration)  set to change intervals when stale multipart uploads are expired (default: '6h')
+delete_cleanup_interval         (duration)  set to change intervals when deleted objects are permanently deleted from ".trash" folder (default: '5m')
+disable_odirect                 (boolean)   set to disable O_DIRECT for reads under special conditions. NOTE: it is not recommended to disable O_DIRECT without prior testing. (default: 'off')
 ```
 
 or environment variables
 
 ```
-MINIO_API_REQUESTS_MAX               (number)    set the maximum number of concurrent requests, e.g. "1600"
-MINIO_API_REQUESTS_DEADLINE          (duration)  set the deadline for API requests waiting to be processed e.g. "1m"
-MINIO_API_CORS_ALLOW_ORIGIN          (csv)       set comma separated list of origins allowed for CORS requests e.g. "https://example1.com,https://example2.com"
-MINIO_API_REMOTE_TRANSPORT_DEADLINE  (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h"
+MINIO_API_REQUESTS_MAX                    (number)    set the maximum number of concurrent requests (default: '0')
+MINIO_API_REQUESTS_DEADLINE               (duration)  set the deadline for API requests waiting to be processed (default: '10s')
+MINIO_API_CLUSTER_DEADLINE                (duration)  set the deadline for cluster readiness check (default: '10s')
+MINIO_API_CORS_ALLOW_ORIGIN               (csv)       set comma separated list of origins allowed for CORS requests (default: '*')
+MINIO_API_REMOTE_TRANSPORT_DEADLINE       (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h" (default: '2h')
+MINIO_API_LIST_QUORUM                     (string)    set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict" (default: 'strict')
+MINIO_API_REPLICATION_PRIORITY            (string)    set replication priority (default: 'auto')
+MINIO_API_TRANSITION_WORKERS              (number)    set the number of transition workers (default: '100')
+MINIO_API_STALE_UPLOADS_EXPIRY            (duration)  set to expire stale multipart uploads older than this values (default: '24h')
+MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL  (duration)  set to change intervals when stale multipart uploads are expired (default: '6h')
+MINIO_API_DELETE_CLEANUP_INTERVAL         (duration)  set to change intervals when deleted objects are permanently deleted from ".trash" folder (default: '5m')
+MINIO_API_DISABLE_ODIRECT                 (boolean)   set to disable O_DIRECT for reads under special conditions. NOTE: it is not recommended to disable O_DIRECT without prior testing. (default: 'off')
 ```
 
 #### Notifications
 
-Notification targets supported by MinIO are in the following list. To configure individual targets please refer to more detailed documentation [here](https://docs.min.io/docs/minio-bucket-notification-guide.html)
+Notification targets supported by MinIO are in the following list. To configure individual targets please refer to more detailed documentation [here](https://min.io/docs/minio/linux/administration/monitoring.html#bucket-notifications).
 
 ```
 notify_webhook        publish bucket notifications to webhook endpoints
@@ -244,7 +228,7 @@ MINIO_ETCD_CLIENT_CERT_KEY  (path)      client cert key for mTLS authentication
 MINIO_ETCD_COMMENT          (sentence)  optionally add a comment to this setting
 ```
 
-This behavior is consistent across all keys, each key self documents itself with valid examples.
+This behavior is consistent across all keys; each key self-documents itself with valid examples.
 
 ## Dynamic systems without restarting server
 
@@ -272,17 +256,16 @@ scanner  manage namespace scanning for usage calculation, lifecycle, healing and
 ARGS:
 delay     (float)     scanner delay multiplier, defaults to '10.0'
 max_wait  (duration)  maximum wait time between operations, defaults to '15s'
+cycle     (duration)  time duration between scanner cycles
 ```
 
-Example: Following setting will decrease the scanner speed by a factor of 3, reducing the system resource use, but increasing the latency of updates being reflected.
+Example: the following setting will decrease the scanner speed by a factor of 3, reducing the system resource use, but increasing the latency of updates being reflected.
 
 ```sh
 ~ mc admin config set alias/ scanner delay=30.0
 ```
 
 Once set the scanner settings are automatically applied without the need for server restarts.
-
-> NOTE: Data usage scanner is not supported under Gateway deployments.
 
 ### Healing
 
@@ -309,8 +292,6 @@ Example: The following settings will increase the heal operation speed by allowi
 
 Once set the healer settings are automatically applied without the need for server restarts.
 
-> NOTE: Healing is not supported for gateway and single drive mode.
-
 ## Environment only settings (not in config)
 
 ### Browser
@@ -326,7 +307,8 @@ minio server /data
 
 ### Domain
 
-By default, MinIO supports path-style requests that are of the format <http://mydomain.com/bucket/object>. `MINIO_DOMAIN` environment variable is used to enable virtual-host-style requests. If the request `Host` header matches with `(.+).mydomain.com` then the matched pattern `$1` is used as bucket and the path is used as object. More information on path-style and virtual-host-style [here](http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAPI.html)
+By default, MinIO supports path-style requests that are of the format <http://mydomain.com/bucket/object>. `MINIO_DOMAIN` environment variable is used to enable virtual-host-style requests. If the request `Host` header matches with `(.+).mydomain.com` then the matched pattern `$1` is used as bucket and the path is used as object. Read more about path-style and virtual-host-style [here](http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAPI.html).
+
 Example:
 
 ```sh
@@ -343,5 +325,5 @@ minio server /data
 
 ## Explore Further
 
-* [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide)
-* [Configure MinIO Server with TLS](https://docs.min.io/docs/how-to-secure-access-to-minio-server-with-tls)
+* [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#quickstart-for-linux)
+* [Configure MinIO Server with TLS](https://min.io/docs/minio/linux/operations/network-encryption.html)

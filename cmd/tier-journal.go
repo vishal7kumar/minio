@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/logger"
-	"github.com/tinylib/msgp/msgp"
 )
 
 //go:generate msgp -file $GOFILE -unexported
@@ -71,25 +70,16 @@ func initTierDeletionJournal(ctx context.Context) (*tierJournal, error) {
 		tierMemJournal:  newTierMemJoural(1000),
 		tierDiskJournal: newTierDiskJournal(),
 	}
+
 	for _, diskPath := range globalEndpoints.LocalDisksPaths() {
 		j.diskPath = diskPath
-		if err := os.MkdirAll(filepath.Dir(j.JournalPath()), os.FileMode(0o700)); err != nil {
-			logger.LogIf(ctx, err)
-			continue
-		}
-
-		err := j.Open()
-		if err != nil {
-			logger.LogIf(ctx, err)
-			continue
-		}
 
 		go j.deletePending(ctx)  // for existing journal entries from previous MinIO versions
 		go j.processEntries(ctx) // for newer journal entries circa free-versions
 		return j, nil
 	}
 
-	return nil, errors.New("no local disk found")
+	return nil, errors.New("no local drive found")
 }
 
 // rotate rotates the journal. If a read-only journal already exists it does
@@ -100,10 +90,8 @@ func (jd *tierDiskJournal) rotate() error {
 	if _, err := os.Stat(jd.ReadOnlyPath()); err == nil {
 		return nil
 	}
-	// Close the active journal if present.
-	jd.Close()
-	// Open a new active journal for subsequent journalling.
-	return jd.Open()
+	// Close the active journal if present and delete it.
+	return jd.Close()
 }
 
 type walkFn func(ctx context.Context, objName, rvID, tierName string) error
@@ -117,8 +105,7 @@ func (jd *tierDiskJournal) JournalPath() string {
 }
 
 func (jd *tierDiskJournal) WalkEntries(ctx context.Context, fn walkFn) {
-	err := jd.rotate()
-	if err != nil {
+	if err := jd.rotate(); err != nil {
 		logger.LogIf(ctx, fmt.Errorf("tier-journal: failed to rotate pending deletes journal %s", err))
 		return
 	}
@@ -132,7 +119,8 @@ func (jd *tierDiskJournal) WalkEntries(ctx context.Context, fn walkFn) {
 		return
 	}
 	defer ro.Close()
-	mr := msgp.NewReader(ro)
+	mr := msgpNewReader(ro)
+	defer readMsgpReaderPoolPut(mr)
 
 	done := false
 	for {
@@ -226,21 +214,17 @@ func (jd *tierDiskJournal) Close() error {
 	if fi, err = f.Stat(); err != nil {
 		return err
 	}
-	defer f.Close()
+	f.Close() // close before rename()
+
 	// Skip renaming active journal if empty.
 	if fi.Size() == tierJournalHdrLen {
-		return nil
+		return os.Remove(jd.JournalPath())
 	}
 
 	jPath := jd.JournalPath()
 	jroPath := jd.ReadOnlyPath()
 	// Rotate active journal to perform pending deletes.
-	err = os.Rename(jPath, jroPath)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return os.Rename(jPath, jroPath)
 }
 
 // Open opens a new active journal. Note: calling Open on an opened journal is a
@@ -253,7 +237,7 @@ func (jd *tierDiskJournal) Open() error {
 	}
 
 	var err error
-	jd.file, err = os.OpenFile(jd.JournalPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY|writeMode, 0o666)
+	jd.file, err = OpenFile(jd.JournalPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY|writeMode, 0o666)
 	if err != nil {
 		return err
 	}
@@ -275,7 +259,7 @@ func (jd *tierDiskJournal) Open() error {
 }
 
 func (jd *tierDiskJournal) OpenRO() (io.ReadCloser, error) {
-	file, err := os.Open(jd.ReadOnlyPath())
+	file, err := Open(jd.ReadOnlyPath())
 	if err != nil {
 		return nil, err
 	}

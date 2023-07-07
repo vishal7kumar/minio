@@ -22,7 +22,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,12 +34,8 @@ type usageTestFile struct {
 }
 
 func TestDataUsageUpdate(t *testing.T) {
-	base, err := ioutil.TempDir("", "TestDataUsageUpdate")
-	if err != nil {
-		t.Skip(err)
-	}
+	base := t.TempDir()
 	const bucket = "bucket"
-	defer os.RemoveAll(base)
 	files := []usageTestFile{
 		{name: "rootfile", size: 10000},
 		{name: "rootfile2", size: 10000},
@@ -67,7 +62,7 @@ func TestDataUsageUpdate(t *testing.T) {
 		return
 	}
 
-	got, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize)
+	got, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +173,7 @@ func TestDataUsageUpdate(t *testing.T) {
 	}
 	// Changed dir must be picked up in this many cycles.
 	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = scanDataFolder(context.Background(), 0, 0, base, got, getSize)
+		got, err = scanDataFolder(context.Background(), 0, 0, base, got, getSize, 0)
 		got.Info.NextCycle++
 		if err != nil {
 			t.Fatal(err)
@@ -251,12 +246,8 @@ func TestDataUsageUpdate(t *testing.T) {
 }
 
 func TestDataUsageUpdatePrefix(t *testing.T) {
-	base, err := ioutil.TempDir("", "TestDataUpdateUsagePrefix")
-	if err != nil {
-		t.Skip(err)
-	}
+	base := t.TempDir()
 	scannerSleeper.Update(0, 0)
-	defer os.RemoveAll(base)
 	files := []usageTestFile{
 		{name: "bucket/rootfile", size: 10000},
 		{name: "bucket/rootfile2", size: 10000},
@@ -289,7 +280,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 		}
 		return
 	}
-	got, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize)
+	got, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +414,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 	}
 	// Changed dir must be picked up in this many cycles.
 	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = scanDataFolder(context.Background(), 0, 0, base, got, getSize)
+		got, err = scanDataFolder(context.Background(), 0, 0, base, got, getSize, 0)
 		got.Info.NextCycle++
 		if err != nil {
 			t.Fatal(err)
@@ -510,7 +501,7 @@ func createUsageTestFiles(t *testing.T, base, bucket string, files []usageTestFi
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = ioutil.WriteFile(filepath.Join(base, bucket, f.name), make([]byte, f.size), os.ModePerm)
+		err = os.WriteFile(filepath.Join(base, bucket, f.name), make([]byte, f.size), os.ModePerm)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -528,7 +519,7 @@ func generateUsageTestFiles(t *testing.T, base, bucket string, nFolders, nFiles,
 		}
 		for j := 0; j < nFiles; j++ {
 			name := filepath.Join(base, bucket, fmt.Sprint(i), fmt.Sprint(j)+".txt")
-			err = ioutil.WriteFile(name, pl, os.ModePerm)
+			err = os.WriteFile(name, pl, os.ModePerm)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -537,12 +528,8 @@ func generateUsageTestFiles(t *testing.T, base, bucket string, nFolders, nFiles,
 }
 
 func TestDataUsageCacheSerialize(t *testing.T) {
-	base, err := ioutil.TempDir("", "TestDataUsageCacheSerialize")
-	if err != nil {
-		t.Skip(err)
-	}
+	base := t.TempDir()
 	const bucket = "abucket"
-	defer os.RemoveAll(base)
 	files := []usageTestFile{
 		{name: "rootfile", size: 10000},
 		{name: "rootfile2", size: 10000},
@@ -575,7 +562,7 @@ func TestDataUsageCacheSerialize(t *testing.T) {
 		}
 		return
 	}
-	want, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize)
+	want, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

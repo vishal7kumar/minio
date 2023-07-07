@@ -20,21 +20,22 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config/identity/openid"
+	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/mux"
 	iampolicy "github.com/minio/pkg/iam/policy"
 	"github.com/minio/pkg/wildcard"
 )
@@ -54,11 +55,12 @@ const (
 	stsLDAPPassword           = "LDAPPassword"
 
 	// STS API action constants
-	clientGrants      = "AssumeRoleWithClientGrants"
-	webIdentity       = "AssumeRoleWithWebIdentity"
-	ldapIdentity      = "AssumeRoleWithLDAPIdentity"
-	clientCertificate = "AssumeRoleWithCertificate"
-	assumeRole        = "AssumeRole"
+	clientGrants        = "AssumeRoleWithClientGrants"
+	webIdentity         = "AssumeRoleWithWebIdentity"
+	ldapIdentity        = "AssumeRoleWithLDAPIdentity"
+	clientCertificate   = "AssumeRoleWithCertificate"
+	customTokenIdentity = "AssumeRoleWithCustomToken"
+	assumeRole          = "AssumeRole"
 
 	stsRequestBodyLimit = 10 * (1 << 20) // 10 MiB
 
@@ -66,7 +68,6 @@ const (
 	expClaim = "exp"
 	subClaim = "sub"
 	audClaim = "aud"
-	azpClaim = "azp"
 	issClaim = "iss"
 
 	// JWT claim to check the parent user
@@ -129,34 +130,52 @@ func registerSTSRouter(router *mux.Router) {
 	stsRouter.Methods(http.MethodPost).HandlerFunc(httpTraceAll(sts.AssumeRoleWithCertificate)).
 		Queries(stsAction, clientCertificate).
 		Queries(stsVersion, stsAPIVersion)
+
+	// AssumeRoleWithCustomToken
+	stsRouter.Methods(http.MethodPost).HandlerFunc(httpTraceAll(sts.AssumeRoleWithCustomToken)).
+		Queries(stsAction, customTokenIdentity).
+		Queries(stsVersion, stsAPIVersion)
 }
 
-func checkAssumeRoleAuth(ctx context.Context, r *http.Request) (user auth.Credentials, isErrCodeSTS bool, stsErr STSErrorCode) {
+func apiToSTSError(authErr APIErrorCode) (stsErrCode STSErrorCode) {
+	switch authErr {
+	case ErrSignatureDoesNotMatch, ErrInvalidAccessKeyID, ErrAccessKeyDisabled:
+		return ErrSTSAccessDenied
+	case ErrServerNotInitialized:
+		return ErrSTSNotInitialized
+	case ErrInternalError:
+		return ErrSTSInternalError
+	default:
+		return ErrSTSAccessDenied
+	}
+}
+
+func checkAssumeRoleAuth(ctx context.Context, r *http.Request) (auth.Credentials, APIErrorCode) {
 	if !isRequestSignatureV4(r) {
-		return user, true, ErrSTSAccessDenied
+		return auth.Credentials{}, ErrAccessDenied
 	}
 
 	s3Err := isReqAuthenticated(ctx, r, globalSite.Region, serviceSTS)
 	if s3Err != ErrNone {
-		return user, false, STSErrorCode(s3Err)
+		return auth.Credentials{}, s3Err
 	}
 
-	user, _, s3Err = getReqAccessKeyV4(r, globalSite.Region, serviceSTS)
+	user, _, s3Err := getReqAccessKeyV4(r, globalSite.Region, serviceSTS)
 	if s3Err != ErrNone {
-		return user, false, STSErrorCode(s3Err)
+		return auth.Credentials{}, s3Err
 	}
 
 	// Temporary credentials or Service accounts cannot generate further temporary credentials.
 	if user.IsTemp() || user.IsServiceAccount() {
-		return user, true, ErrSTSAccessDenied
+		return auth.Credentials{}, ErrAccessDenied
 	}
 
 	// Session tokens are not allowed in STS AssumeRole requests.
 	if getSessionToken(r) != "" {
-		return user, true, ErrSTSAccessDenied
+		return auth.Credentials{}, ErrAccessDenied
 	}
 
-	return user, true, ErrSTSNone
+	return user, ErrNone
 }
 
 func parseForm(r *http.Request) error {
@@ -177,19 +196,22 @@ func parseForm(r *http.Request) error {
 func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "AssumeRole")
 
+	claims := make(map[string]interface{})
+	defer logger.AuditLog(ctx, w, r, claims)
+
 	// Check auth here (otherwise r.Form will have unexpected values from
 	// the call to `parseForm` below), but return failure only after we are
 	// able to validate that it is a valid STS request, so that we are able
 	// to send an appropriate audit log.
-	user, isErrCodeSTS, stsErr := checkAssumeRoleAuth(ctx, r)
+	user, apiErrCode := checkAssumeRoleAuth(ctx, r)
 
 	if err := parseForm(r); err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
 
 	if r.Form.Get(stsVersion) != stsAPIVersion {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, fmt.Errorf("Invalid STS API version %s, expecting %s", r.Form.Get(stsVersion), stsAPIVersion))
+		writeSTSErrorResponse(ctx, w, ErrSTSMissingParameter, fmt.Errorf("Invalid STS API version %s, expecting %s", r.Form.Get(stsVersion), stsAPIVersion))
 		return
 	}
 
@@ -197,17 +219,17 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case assumeRole:
 	default:
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
 		return
 	}
 
 	ctx = newContext(r, w, action)
-	defer logger.AuditLog(ctx, w, r, nil)
 
-	// Validate the authentication result here so that failures will be
-	// audit-logged.
-	if stsErr != ErrSTSNone {
-		writeSTSErrorResponse(ctx, w, isErrCodeSTS, stsErr, nil)
+	// Validate the authentication result here so that failures will be audit-logged.
+	if apiErrCode != ErrNone {
+		stsErr := apiToSTSError(apiErrCode)
+		// Borrow the description error from the API error code
+		writeSTSErrorResponse(ctx, w, stsErr, fmt.Errorf(errorCodes[apiErrCode].Description))
 		return
 	}
 
@@ -216,51 +238,48 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 	// The plain text that you use for both inline and managed session
 	// policies shouldn't exceed 2048 characters.
 	if len(sessionPolicyStr) > 2048 {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Session policy shouldn't exceed 2048 characters"))
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, errSessionPolicyTooLarge)
 		return
 	}
 
 	if len(sessionPolicyStr) > 0 {
 		sessionPolicy, err := iampolicy.ParseConfig(bytes.NewReader([]byte(sessionPolicyStr)))
 		if err != nil {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 			return
 		}
 
 		// Version in policy must not be empty
 		if sessionPolicy.Version == "" {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Version cannot be empty expecting '2012-10-17'"))
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Version cannot be empty expecting '2012-10-17'"))
 			return
 		}
 	}
 
 	duration, err := openid.GetDefaultExpiration(r.Form.Get(stsDurationSeconds))
 	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
 
-	m := map[string]interface{}{
-		expClaim:    UTCNow().Add(duration).Unix(),
-		parentClaim: user.AccessKey,
-	}
+	claims[expClaim] = UTCNow().Add(duration).Unix()
+	claims[parentClaim] = user.AccessKey
 
 	// Validate that user.AccessKey's policies can be retrieved - it may not
 	// be in case the user is disabled.
-	_, err = globalIAMSys.PolicyDBGet(user.AccessKey, false)
-	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+	if _, err = globalIAMSys.PolicyDBGet(user.AccessKey, false); err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
 
 	if len(sessionPolicyStr) > 0 {
-		m[iampolicy.SessionPolicyName] = base64.StdEncoding.EncodeToString([]byte(sessionPolicyStr))
+		claims[iampolicy.SessionPolicyName] = base64.StdEncoding.EncodeToString([]byte(sessionPolicyStr))
 	}
 
 	secret := globalActiveCred.SecretKey
-	cred, err := auth.GetNewCredentialsWithMetadata(m, secret)
+	cred, err := auth.GetNewCredentialsWithMetadata(claims, secret)
 	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
 		return
 	}
 
@@ -269,14 +288,15 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 	cred.ParentUser = user.AccessKey
 
 	// Set the newly generated credentials.
-	if err = globalIAMSys.SetTempUser(ctx, cred.AccessKey, cred, ""); err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+	updatedAt, err := globalIAMSys.SetTempUser(ctx, cred.AccessKey, cred, "")
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
 		return
 	}
 
 	// Call hook for site replication.
 	if cred.ParentUser != globalActiveCred.AccessKey {
-		if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+		logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 			Type: madmin.SRIAMItemSTSAcc,
 			STSCredential: &madmin.SRSTSCredential{
 				AccessKey:    cred.AccessKey,
@@ -284,10 +304,8 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 				SessionToken: cred.SessionToken,
 				ParentUser:   cred.ParentUser,
 			},
-		}); err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
-		}
+			UpdatedAt: updatedAt,
+		}))
 	}
 
 	assumeRoleResponse := &AssumeRoleResponse{
@@ -303,14 +321,17 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "AssumeRoleSSOCommon")
 
+	claims := make(map[string]interface{})
+	defer logger.AuditLog(ctx, w, r, claims)
+
 	// Parse the incoming form data.
 	if err := parseForm(r); err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
 
 	if r.Form.Get(stsVersion) != stsAPIVersion {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, fmt.Errorf("Invalid STS API version %s, expecting %s", r.Form.Get("Version"), stsAPIVersion))
+		writeSTSErrorResponse(ctx, w, ErrSTSMissingParameter, fmt.Errorf("Invalid STS API version %s, expecting %s", r.Form.Get("Version"), stsAPIVersion))
 		return
 	}
 
@@ -321,23 +342,11 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 		return
 	case clientGrants, webIdentity:
 	default:
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
 		return
 	}
 
 	ctx = newContext(r, w, action)
-	defer logger.AuditLog(ctx, w, r, nil)
-
-	if globalOpenIDValidators == nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSNotInitialized, errServerNotInitialized)
-		return
-	}
-
-	v, err := globalOpenIDValidators.Get("jwt")
-	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
-		return
-	}
 
 	token := r.Form.Get(stsToken)
 	if token == "" {
@@ -346,96 +355,72 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 
 	accessToken := r.Form.Get(stsWebIdentityAccessToken)
 
-	m, err := v.Validate(token, accessToken, r.Form.Get(stsDurationSeconds))
-	if err != nil {
+	// RoleARN parameter processing: If a role ARN is given in the request, we
+	// use that and validate the authentication request. If not, we assume this
+	// is an STS request for a claim based IDP (if one is present) and set
+	// roleArn = openid.DummyRoleARN.
+	//
+	// Currently, we do not support multiple claim based IDPs, as there is no
+	// defined parameter to disambiguate the intended IDP in this STS request.
+	roleArn := openid.DummyRoleARN
+	roleArnStr := r.Form.Get(stsRoleArn)
+	if roleArnStr != "" {
+		var err error
+		roleArn, _, err = globalIAMSys.GetRolePolicy(roleArnStr)
+		if err != nil {
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
+				fmt.Errorf("Error processing %s parameter: %v", stsRoleArn, err))
+			return
+		}
+	}
+
+	// Validate JWT; check clientID in claims matches the one associated with the roleArn
+	if err := globalIAMSys.OpenIDConfig.Validate(r.Context(), roleArn, token, accessToken, r.Form.Get(stsDurationSeconds), claims); err != nil {
 		switch err {
 		case openid.ErrTokenExpired:
 			switch action {
 			case clientGrants:
-				writeSTSErrorResponse(ctx, w, true, ErrSTSClientGrantsExpiredToken, err)
+				writeSTSErrorResponse(ctx, w, ErrSTSClientGrantsExpiredToken, err)
 			case webIdentity:
-				writeSTSErrorResponse(ctx, w, true, ErrSTSWebIdentityExpiredToken, err)
+				writeSTSErrorResponse(ctx, w, ErrSTSWebIdentityExpiredToken, err)
 			}
 			return
 		case auth.ErrInvalidDuration:
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 			return
 		}
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
-	}
-
-	// REQUIRED. Audience(s) that this ID Token is intended for.
-	// It MUST contain the OAuth 2.0 client_id of the Relying Party
-	// as an audience value. It MAY also contain identifiers for
-	// other audiences. In the general case, the aud value is an
-	// array of case sensitive strings. In the common special case
-	// when there is one audience, the aud value MAY be a single
-	// case sensitive
-	audValues, ok := iampolicy.GetValuesFromClaims(m, audClaim)
-	if !ok {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
-			errors.New("STS JWT Token has `aud` claim invalid, `aud` must match configured OpenID Client ID"))
-		return
-	}
-	if !audValues.Contains(globalOpenIDConfig.ClientID) {
-		// if audience claims is missing, look for "azp" claims.
-		// OPTIONAL. Authorized party - the party to which the ID
-		// Token was issued. If present, it MUST contain the OAuth
-		// 2.0 Client ID of this party. This Claim is only needed
-		// when the ID Token has a single audience value and that
-		// audience is different than the authorized party. It MAY
-		// be included even when the authorized party is the same
-		// as the sole audience. The azp value is a case sensitive
-		// string containing a StringOrURI value
-		azpValues, ok := iampolicy.GetValuesFromClaims(m, azpClaim)
-		if !ok {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
-				errors.New("STS JWT Token has `aud` claim invalid, `aud` must match configured OpenID Client ID"))
-			return
-		}
-		if !azpValues.Contains(globalOpenIDConfig.ClientID) {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
-				errors.New("STS JWT Token has `azp` claim invalid, `azp` must match configured OpenID Client ID"))
-			return
-		}
 	}
 
 	var policyName string
-	if globalIAMSys.HasRolePolicy() {
-		roleArn := r.Form.Get(stsRoleArn)
-		_, err := globalIAMSys.GetRolePolicy(roleArn)
-		if err != nil {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
-				fmt.Errorf("Error processing %s parameter: %v", stsRoleArn, err))
-			return
-		}
+	if roleArnStr != "" && globalIAMSys.HasRolePolicy() {
 		// If roleArn is used, we set it as a claim, and use the
 		// associated policy when credentials are used.
-		m[roleArnClaim] = roleArn
+		claims[roleArnClaim] = roleArn.String()
 	} else {
 		// If no role policy is configured, then we use claims from the
 		// JWT. This is a MinIO STS API specific value, this value
 		// should be set and configured on your identity provider as
 		// part of JWT custom claims.
-		policySet, ok := iampolicy.GetPoliciesFromClaims(m, iamPolicyClaimNameOpenID())
+		policySet, ok := iampolicy.GetPoliciesFromClaims(claims, iamPolicyClaimNameOpenID())
 		policies := strings.Join(policySet.ToSlice(), ",")
 		if ok {
 			policyName = globalIAMSys.CurrentPolicies(policies)
 		}
 
-		if globalPolicyOPA == nil {
+		if newGlobalAuthZPluginFn() == nil {
 			if !ok {
-				writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
+				writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 					fmt.Errorf("%s claim missing from the JWT token, credentials will not be generated", iamPolicyClaimNameOpenID()))
 				return
 			} else if policyName == "" {
-				writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
+				writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 					fmt.Errorf("None of the given policies (`%s`) are defined, credentials will not be generated", policies))
 				return
 			}
 		}
-		m[iamPolicyClaimNameOpenID()] = policyName
+		claims[iamPolicyClaimNameOpenID()] = policyName
 	}
 
 	sessionPolicyStr := r.Form.Get(stsPolicy)
@@ -443,30 +428,30 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	// The plain text that you use for both inline and managed session
 	// policies shouldn't exceed 2048 characters.
 	if len(sessionPolicyStr) > 2048 {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Session policy should not exceed 2048 characters"))
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Session policy should not exceed 2048 characters"))
 		return
 	}
 
 	if len(sessionPolicyStr) > 0 {
 		sessionPolicy, err := iampolicy.ParseConfig(bytes.NewReader([]byte(sessionPolicyStr)))
 		if err != nil {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 			return
 		}
 
 		// Version in policy must not be empty
 		if sessionPolicy.Version == "" {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Invalid session policy version"))
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Invalid session policy version"))
 			return
 		}
 
-		m[iampolicy.SessionPolicyName] = base64.StdEncoding.EncodeToString([]byte(sessionPolicyStr))
+		claims[iampolicy.SessionPolicyName] = base64.StdEncoding.EncodeToString([]byte(sessionPolicyStr))
 	}
 
 	secret := globalActiveCred.SecretKey
-	cred, err := auth.GetNewCredentialsWithMetadata(m, secret)
+	cred, err := auth.GetNewCredentialsWithMetadata(claims, secret)
 	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
 		return
 	}
 
@@ -476,18 +461,18 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	// parentUser as per the requirements for service accounts for OpenID
 	// based logins.
 	var subFromToken string
-	if v, ok := m[subClaim]; ok {
+	if v, ok := claims[subClaim]; ok {
 		subFromToken, _ = v.(string)
 	}
 
 	if subFromToken == "" {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 			errors.New("STS JWT Token has `sub` claim missing, `sub` claim is mandatory"))
 		return
 	}
 
 	var issFromToken string
-	if v, ok := m[issClaim]; ok {
+	if v, ok := claims[issClaim]; ok {
 		issFromToken, _ = v.(string)
 	}
 
@@ -504,13 +489,14 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Set the newly generated credentials.
-	if err = globalIAMSys.SetTempUser(ctx, cred.AccessKey, cred, policyName); err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+	updatedAt, err := globalIAMSys.SetTempUser(ctx, cred.AccessKey, cred, policyName)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
 		return
 	}
 
 	// Call hook for site replication.
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+	logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 		Type: madmin.SRIAMItemSTSAcc,
 		STSCredential: &madmin.SRSTSCredential{
 			AccessKey:           cred.AccessKey,
@@ -519,10 +505,8 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 			ParentUser:          cred.ParentUser,
 			ParentPolicyMapping: policyName,
 		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
+		UpdatedAt: updatedAt,
+	}))
 
 	var encodedSuccessResponse []byte
 	switch action {
@@ -554,7 +538,8 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 // Connect-compatible identity provider.
 //
 // Eg:-
-//    $ curl https://minio:9000/?Action=AssumeRoleWithWebIdentity&WebIdentityToken=<jwt>
+//
+//	$ curl https://minio:9000/?Action=AssumeRoleWithWebIdentity&WebIdentityToken=<jwt>
 func (sts *stsAPIHandlers) AssumeRoleWithWebIdentity(w http.ResponseWriter, r *http.Request) {
 	sts.AssumeRoleWithSSO(w, r)
 }
@@ -563,7 +548,8 @@ func (sts *stsAPIHandlers) AssumeRoleWithWebIdentity(w http.ResponseWriter, r *h
 // OAuth2.0 client credential grants.
 //
 // Eg:-
-//    $ curl https://minio:9000/?Action=AssumeRoleWithClientGrants&Token=<jwt>
+//
+//	$ curl https://minio:9000/?Action=AssumeRoleWithClientGrants&Token=<jwt>
 func (sts *stsAPIHandlers) AssumeRoleWithClientGrants(w http.ResponseWriter, r *http.Request) {
 	sts.AssumeRoleWithSSO(w, r)
 }
@@ -572,16 +558,17 @@ func (sts *stsAPIHandlers) AssumeRoleWithClientGrants(w http.ResponseWriter, r *
 func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "AssumeRoleWithLDAPIdentity")
 
-	defer logger.AuditLog(ctx, w, r, nil, stsLDAPPassword)
+	claims := make(map[string]interface{})
+	defer logger.AuditLog(ctx, w, r, claims, stsLDAPPassword)
 
 	// Parse the incoming form data.
 	if err := parseForm(r); err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
 
 	if r.Form.Get(stsVersion) != stsAPIVersion {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter,
+		writeSTSErrorResponse(ctx, w, ErrSTSMissingParameter,
 			fmt.Errorf("Invalid STS API version %s, expecting %s", r.Form.Get("Version"), stsAPIVersion))
 		return
 	}
@@ -590,7 +577,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	ldapPassword := r.Form.Get(stsLDAPPassword)
 
 	if ldapUsername == "" || ldapPassword == "" {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, fmt.Errorf("LDAPUsername and LDAPPassword cannot be empty"))
+		writeSTSErrorResponse(ctx, w, ErrSTSMissingParameter, fmt.Errorf("LDAPUsername and LDAPPassword cannot be empty"))
 		return
 	}
 
@@ -598,7 +585,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	switch action {
 	case ldapIdentity:
 	default:
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
 		return
 	}
 
@@ -607,60 +594,58 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	// The plain text that you use for both inline and managed session
 	// policies shouldn't exceed 2048 characters.
 	if len(sessionPolicyStr) > 2048 {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Session policy should not exceed 2048 characters"))
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Session policy should not exceed 2048 characters"))
 		return
 	}
 
 	if len(sessionPolicyStr) > 0 {
 		sessionPolicy, err := iampolicy.ParseConfig(bytes.NewReader([]byte(sessionPolicyStr)))
 		if err != nil {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 			return
 		}
 
 		// Version in policy must not be empty
 		if sessionPolicy.Version == "" {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Version needs to be specified in session policy"))
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Version needs to be specified in session policy"))
 			return
 		}
 	}
 
-	ldapUserDN, groupDistNames, err := globalLDAPConfig.Bind(ldapUsername, ldapPassword)
+	ldapUserDN, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(ldapUsername, ldapPassword)
 	if err != nil {
 		err = fmt.Errorf("LDAP server error: %w", err)
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
 
 	// Check if this user or their groups have a policy applied.
 	ldapPolicies, _ := globalIAMSys.PolicyDBGet(ldapUserDN, false, groupDistNames...)
-	if len(ldapPolicies) == 0 && globalPolicyOPA == nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
+	if len(ldapPolicies) == 0 && newGlobalAuthZPluginFn() == nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 			fmt.Errorf("expecting a policy to be set for user `%s` or one of their groups: `%s` - rejecting this request",
 				ldapUserDN, strings.Join(groupDistNames, "`,`")))
 		return
 	}
 
-	expiryDur, err := globalLDAPConfig.GetExpiryDuration(r.Form.Get(stsDurationSeconds))
+	expiryDur, err := globalIAMSys.LDAPConfig.GetExpiryDuration(r.Form.Get(stsDurationSeconds))
 	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
 
-	m := map[string]interface{}{
-		expClaim:  UTCNow().Add(expiryDur).Unix(),
-		ldapUser:  ldapUserDN,
-		ldapUserN: ldapUsername,
-	}
+	claims[expClaim] = UTCNow().Add(expiryDur).Unix()
+	claims[ldapUser] = ldapUserDN
+	claims[ldapUserN] = ldapUsername
 
 	if len(sessionPolicyStr) > 0 {
-		m[iampolicy.SessionPolicyName] = base64.StdEncoding.EncodeToString([]byte(sessionPolicyStr))
+		claims[iampolicy.SessionPolicyName] = base64.StdEncoding.EncodeToString([]byte(sessionPolicyStr))
 	}
 
 	secret := globalActiveCred.SecretKey
-	cred, err := auth.GetNewCredentialsWithMetadata(m, secret)
+	cred, err := auth.GetNewCredentialsWithMetadata(claims, secret)
 	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
 		return
 	}
 
@@ -675,13 +660,14 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	// Set the newly generated credentials, policyName is empty on purpose
 	// LDAP policies are applied automatically using their ldapUser, ldapGroups
 	// mapping.
-	if err = globalIAMSys.SetTempUser(ctx, cred.AccessKey, cred, ""); err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+	updatedAt, err := globalIAMSys.SetTempUser(ctx, cred.AccessKey, cred, "")
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
 		return
 	}
 
 	// Call hook for site replication.
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+	logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 		Type: madmin.SRIAMItemSTSAcc,
 		STSCredential: &madmin.SRSTSCredential{
 			AccessKey:    cred.AccessKey,
@@ -689,10 +675,8 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 			SessionToken: cred.SessionToken,
 			ParentUser:   cred.ParentUser,
 		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
+		UpdatedAt: updatedAt,
+	}))
 
 	ldapIdentityResponse := &AssumeRoleWithLDAPResponse{
 		Result: LDAPIdentityResult{
@@ -713,8 +697,11 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "AssumeRoleWithCertificate")
 
-	if !globalSTSTLSConfig.Enabled {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSNotInitialized, errors.New("STS API 'AssumeRoleWithCertificate' is disabled"))
+	claims := make(map[string]interface{})
+	defer logger.AuditLog(ctx, w, r, claims)
+
+	if !globalIAMSys.STSTLSConfig.Enabled {
+		writeSTSErrorResponse(ctx, w, ErrSTSNotInitialized, errors.New("STS API 'AssumeRoleWithCertificate' is disabled"))
 		return
 	}
 
@@ -723,7 +710,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	// Otherwise, we don't have a certificate to verify or
 	// the policy lookup would ambigious.
 	if r.TLS == nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInsecureConnection, errors.New("No TLS connection attempt"))
+		writeSTSErrorResponse(ctx, w, ErrSTSInsecureConnection, errors.New("No TLS connection attempt"))
 		return
 	}
 
@@ -745,16 +732,16 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	// Now, we have to check that the client has provided exactly one leaf
 	// certificate that we can map to a policy.
 	if len(r.TLS.PeerCertificates) == 0 {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, errors.New("No client certificate provided"))
+		writeSTSErrorResponse(ctx, w, ErrSTSMissingParameter, errors.New("No client certificate provided"))
 		return
 	}
 	if len(r.TLS.PeerCertificates) > 1 {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, errors.New("More than one client certificate provided"))
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, errors.New("More than one client certificate provided"))
 		return
 	}
 
 	certificate := r.TLS.PeerCertificates[0]
-	if !globalSTSTLSConfig.InsecureSkipVerify { // Verify whether the client certificate has been issued by a trusted CA.
+	if !globalIAMSys.STSTLSConfig.InsecureSkipVerify { // Verify whether the client certificate has been issued by a trusted CA.
 		_, err := certificate.Verify(x509.VerifyOptions{
 			KeyUsages: []x509.ExtKeyUsage{
 				x509.ExtKeyUsageClientAuth,
@@ -762,7 +749,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 			Roots: globalRootCAs,
 		})
 		if err != nil {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidClientCertificate, err)
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidClientCertificate, err)
 			return
 		}
 	} else {
@@ -787,7 +774,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 			}
 		}
 		if !validKeyUsage {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, errors.New("certificate is not valid for client authentication"))
+			writeSTSErrorResponse(ctx, w, ErrSTSMissingParameter, errors.New("certificate is not valid for client authentication"))
 			return
 		}
 	}
@@ -799,13 +786,13 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	//
 	// Group mapping is not possible with standard X.509 certificates.
 	if certificate.Subject.CommonName == "" {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, errors.New("certificate subject CN cannot be empty"))
+		writeSTSErrorResponse(ctx, w, ErrSTSMissingParameter, errors.New("certificate subject CN cannot be empty"))
 		return
 	}
 
-	expiry, err := globalSTSTLSConfig.GetExpiryDuration(r.Form.Get(stsDurationSeconds))
+	expiry, err := globalIAMSys.STSTLSConfig.GetExpiryDuration(r.Form.Get(stsDurationSeconds))
 	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSMissingParameter, err)
 		return
 	}
 
@@ -820,28 +807,28 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	// Associate any service accounts to the certificate CN
 	parentUser := "tls:" + certificate.Subject.CommonName
 
-	tmpCredentials, err := auth.GetNewCredentialsWithMetadata(map[string]interface{}{
-		expClaim:    UTCNow().Add(expiry).Unix(),
-		parentClaim: parentUser,
-		subClaim:    certificate.Subject.CommonName,
-		audClaim:    certificate.Subject.Organization,
-		issClaim:    certificate.Issuer.CommonName,
-	}, globalActiveCred.SecretKey)
+	claims[expClaim] = UTCNow().Add(expiry).Unix()
+	claims[subClaim] = certificate.Subject.CommonName
+	claims[audClaim] = certificate.Subject.Organization
+	claims[issClaim] = certificate.Issuer.CommonName
+	claims[parentClaim] = parentUser
+
+	tmpCredentials, err := auth.GetNewCredentialsWithMetadata(claims, globalActiveCred.SecretKey)
 	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
 		return
 	}
 
 	tmpCredentials.ParentUser = parentUser
 	policyName := certificate.Subject.CommonName
-	err = globalIAMSys.SetTempUser(ctx, tmpCredentials.AccessKey, tmpCredentials, policyName)
+	updatedAt, err := globalIAMSys.SetTempUser(ctx, tmpCredentials.AccessKey, tmpCredentials, policyName)
 	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
 		return
 	}
 
 	// Call hook for site replication.
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+	logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 		Type: madmin.SRIAMItemSTSAcc,
 		STSCredential: &madmin.SRSTSCredential{
 			AccessKey:           tmpCredentials.AccessKey,
@@ -850,13 +837,132 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 			ParentUser:          tmpCredentials.ParentUser,
 			ParentPolicyMapping: policyName,
 		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
+		UpdatedAt: updatedAt,
+	}))
 
 	response := new(AssumeRoleWithCertificateResponse)
 	response.Result.Credentials = tmpCredentials
+	response.Metadata.RequestID = w.Header().Get(xhttp.AmzRequestID)
+	writeSuccessResponseXML(w, encodeResponse(response))
+}
+
+// AssumeRoleWithCustomToken implements user authentication with custom tokens.
+// These tokens are opaque to MinIO and are verified by a configured (external)
+// Identity Management Plugin.
+//
+// API endpoint: https://minio:9000?Action=AssumeRoleWithCustomToken&Token=xxx
+func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "AssumeRoleWithCustomToken")
+
+	claims := make(map[string]interface{})
+	defer logger.AuditLog(ctx, w, r, claims)
+
+	authn := newGlobalAuthNPluginFn()
+	if authn == nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSNotInitialized, errors.New("STS API 'AssumeRoleWithCustomToken' is disabled"))
+		return
+	}
+
+	action := r.Form.Get(stsAction)
+	if action != customTokenIdentity {
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
+		return
+	}
+
+	token := r.Form.Get(stsToken)
+	if token == "" {
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Invalid empty `Token` parameter provided"))
+		return
+	}
+
+	durationParam := r.Form.Get(stsDurationSeconds)
+	var requestedDuration int
+	if durationParam != "" {
+		var err error
+		requestedDuration, err = strconv.Atoi(durationParam)
+		if err != nil {
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, fmt.Errorf("Invalid requested duration: %s", durationParam))
+			return
+		}
+	}
+
+	roleArnStr := r.Form.Get(stsRoleArn)
+	roleArn, _, err := globalIAMSys.GetRolePolicy(roleArnStr)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
+			fmt.Errorf("Error processing parameter %s: %v", stsRoleArn, err))
+		return
+	}
+
+	res, err := authn.Authenticate(roleArn, token)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
+		return
+	}
+
+	// If authentication failed, return the error message to the user.
+	if res.Failure != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSUpstreamError, errors.New(res.Failure.Reason))
+		return
+	}
+
+	// It is required that parent user be set.
+	if res.Success.User == "" {
+		writeSTSErrorResponse(ctx, w, ErrSTSUpstreamError, errors.New("A valid user was not returned by the authenticator."))
+		return
+	}
+
+	// Expiry is set as minimum of requested value and value allowed by auth
+	// plugin.
+	expiry := res.Success.MaxValiditySeconds
+	if durationParam != "" && requestedDuration < expiry {
+		expiry = requestedDuration
+	}
+
+	parentUser := "custom:" + res.Success.User
+
+	// metadata map
+	claims[expClaim] = UTCNow().Add(time.Duration(expiry) * time.Second).Unix()
+	claims[subClaim] = parentUser
+	claims[roleArnClaim] = roleArn.String()
+	claims[parentClaim] = parentUser
+
+	// Add all other claims from the plugin **without** replacing any
+	// existing claims.
+	for k, v := range res.Success.Claims {
+		if _, ok := claims[k]; !ok {
+			claims[k] = v
+		}
+	}
+
+	tmpCredentials, err := auth.GetNewCredentialsWithMetadata(claims, globalActiveCred.SecretKey)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+		return
+	}
+
+	tmpCredentials.ParentUser = parentUser
+	updatedAt, err := globalIAMSys.SetTempUser(ctx, tmpCredentials.AccessKey, tmpCredentials, "")
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+		return
+	}
+
+	// Call hook for site replication.
+	logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+		Type: madmin.SRIAMItemSTSAcc,
+		STSCredential: &madmin.SRSTSCredential{
+			AccessKey:    tmpCredentials.AccessKey,
+			SecretKey:    tmpCredentials.SecretKey,
+			SessionToken: tmpCredentials.SessionToken,
+			ParentUser:   tmpCredentials.ParentUser,
+		},
+		UpdatedAt: updatedAt,
+	}))
+
+	response := new(AssumeRoleWithCustomTokenResponse)
+	response.Result.Credentials = tmpCredentials
+	response.Result.AssumedUser = parentUser
 	response.Metadata.RequestID = w.Header().Get(xhttp.AmzRequestID)
 	writeSuccessResponseXML(w, encodeResponse(response))
 }

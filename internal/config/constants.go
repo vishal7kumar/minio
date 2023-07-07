@@ -48,27 +48,25 @@ const (
 	EnvPublicIPs  = "MINIO_PUBLIC_IPS"
 	EnvFSOSync    = "MINIO_FS_OSYNC"
 	EnvArgs       = "MINIO_ARGS"
+	EnvVolumes    = "MINIO_VOLUMES"
 	EnvDNSWebhook = "MINIO_DNS_WEBHOOK_ENDPOINT"
 
 	EnvSiteName   = "MINIO_SITE_NAME"
 	EnvSiteRegion = "MINIO_SITE_REGION"
 
-	EnvMinIOSubnetLicense      = "MINIO_SUBNET_LICENSE" // Deprecated Dec 2021
-	EnvMinIOSubnetAPIKey       = "MINIO_SUBNET_API_KEY"
-	EnvMinIOSubnetProxy        = "MINIO_SUBNET_PROXY"
-	EnvMinIOServerURL          = "MINIO_SERVER_URL"
-	EnvMinIOBrowserRedirectURL = "MINIO_BROWSER_REDIRECT_URL"
-	EnvRootDiskThresholdSize   = "MINIO_ROOTDISK_THRESHOLD_SIZE"
+	EnvMinIOSubnetLicense = "MINIO_SUBNET_LICENSE" // Deprecated Dec 2021
+	EnvMinIOSubnetAPIKey  = "MINIO_SUBNET_API_KEY"
+	EnvMinIOSubnetProxy   = "MINIO_SUBNET_PROXY"
+
+	EnvMinIOCallhomeEnable    = "MINIO_CALLHOME_ENABLE"
+	EnvMinIOCallhomeFrequency = "MINIO_CALLHOME_FREQUENCY"
+
+	EnvMinIOServerURL        = "MINIO_SERVER_URL"
+	EnvBrowserRedirectURL    = "MINIO_BROWSER_REDIRECT_URL"
+	EnvRootDiskThresholdSize = "MINIO_ROOTDISK_THRESHOLD_SIZE"
+	EnvBrowserLoginAnimation = "MINIO_BROWSER_LOGIN_ANIMATION"
 
 	EnvUpdate = "MINIO_UPDATE"
-
-	EnvKMSSecretKey     = "MINIO_KMS_SECRET_KEY"
-	EnvKMSSecretKeyFile = "MINIO_KMS_SECRET_KEY_FILE"
-	EnvKESEndpoint      = "MINIO_KMS_KES_ENDPOINT"
-	EnvKESKeyName       = "MINIO_KMS_KES_KEY_NAME"
-	EnvKESClientKey     = "MINIO_KMS_KES_KEY_FILE"
-	EnvKESClientCert    = "MINIO_KMS_KES_CERT_FILE"
-	EnvKESServerCA      = "MINIO_KMS_KES_CAPATH"
 
 	EnvEndpoints  = "MINIO_ENDPOINTS"   // legacy
 	EnvWorm       = "MINIO_WORM"        // legacy

@@ -18,14 +18,16 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/xml"
 	"io"
 	"net/http"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/gorilla/mux"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/mux"
 	"github.com/minio/pkg/bucket/policy"
 )
 
@@ -63,28 +65,28 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 		return
 	}
 
-	if globalSiteReplicationSys.isEnabled() {
+	if globalSiteReplicationSys.isEnabled() && !v.Enabled() {
 		writeErrorResponse(ctx, w, APIError{
 			Code:           "InvalidBucketState",
-			Description:    "Cluster replication is enabled for this site, so the versioning state cannot be changed.",
-			HTTPStatusCode: http.StatusConflict,
+			Description:    "Cluster replication is enabled on this site, versioning cannot be suspended on bucket.",
+			HTTPStatusCode: http.StatusBadRequest,
 		}, r.URL)
 		return
 	}
 
-	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); rcfg.LockEnabled && v.Suspended() {
+	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); rcfg.LockEnabled && (v.Suspended() || v.PrefixesExcluded()) {
 		writeErrorResponse(ctx, w, APIError{
 			Code:           "InvalidBucketState",
-			Description:    "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
-			HTTPStatusCode: http.StatusConflict,
+			Description:    "An Object Lock configuration is present on this bucket, versioning cannot be suspended.",
+			HTTPStatusCode: http.StatusBadRequest,
 		}, r.URL)
 		return
 	}
 	if _, err := getReplicationConfig(ctx, bucket); err == nil && v.Suspended() {
 		writeErrorResponse(ctx, w, APIError{
 			Code:           "InvalidBucketState",
-			Description:    "A replication configuration is present on this bucket, so the versioning state cannot be changed.",
-			HTTPStatusCode: http.StatusConflict,
+			Description:    "A replication configuration is present on this bucket, bucket wide versioning cannot be suspended.",
+			HTTPStatusCode: http.StatusBadRequest,
 		}, r.URL)
 		return
 	}
@@ -95,10 +97,23 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 		return
 	}
 
-	if err = globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, configData); err != nil {
+	updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, configData)
+	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+
+	// Call site replication hook.
+	//
+	// We encode the xml bytes as base64 to ensure there are no encoding
+	// errors.
+	cfgStr := base64.StdEncoding.EncodeToString(configData)
+	logger.LogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+		Type:       madmin.SRBucketMetaTypeVersionConfig,
+		Bucket:     bucket,
+		Versioning: &cfgStr,
+		UpdatedAt:  updatedAt,
+	}))
 
 	writeSuccessResponseHeadersOnly(w)
 }
@@ -125,7 +140,7 @@ func (api objectAPIHandlers) GetBucketVersioningHandler(w http.ResponseWriter, r
 	}
 
 	// Check if bucket exists.
-	if _, err := objectAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}

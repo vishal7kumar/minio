@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -110,7 +109,7 @@ func formatCacheGetVersion(r io.ReadSeeker) (string, error) {
 // Creates a new cache format.json if unformatted.
 func createFormatCache(fsFormatPath string, format *formatCacheV1) error {
 	// open file using READ & WRITE permission
-	file, err := os.OpenFile(fsFormatPath, os.O_RDWR|os.O_CREATE, 0o600)
+	file, err := os.OpenFile(fsFormatPath, os.O_RDWR|os.O_CREATE, 0o666)
 	if err != nil {
 		return err
 	}
@@ -155,7 +154,7 @@ func loadFormatCache(ctx context.Context, drives []string) ([]*formatCacheV2, bo
 	migrating := false
 	for i, drive := range drives {
 		cacheFormatPath := pathJoin(drive, minioMetaBucket, formatConfigFile)
-		f, err := os.OpenFile(cacheFormatPath, os.O_RDWR, 0)
+		f, err := os.OpenFile(cacheFormatPath, os.O_RDWR, 0o666)
 		if err != nil {
 			if osIsNotExist(err) {
 				continue
@@ -355,11 +354,12 @@ func migrateCacheData(ctx context.Context, c *diskCache, bucket, object, oldfile
 	if err != nil {
 		return err
 	}
+	defer readCloser.Close()
 	var reader io.Reader = readCloser
 
 	actualSize := uint64(st.Size())
 	if globalCacheKMS != nil {
-		reader, err = newCacheEncryptReader(readCloser, bucket, object, metadata)
+		reader, err = newCacheEncryptReader(ctx, readCloser, bucket, object, metadata)
 		if err != nil {
 			return err
 		}
@@ -371,9 +371,10 @@ func migrateCacheData(ctx context.Context, c *diskCache, bucket, object, oldfile
 
 // migrate cache contents from old cacheFS format to new backend format
 // new format is flat
-//  sha(bucket,object)/  <== dir name
-//      - part.1         <== data
-//      - cache.json     <== metadata
+//
+//	sha(bucket,object)/  <== dir name
+//	    - part.1         <== data
+//	    - cache.json     <== metadata
 func migrateOldCache(ctx context.Context, c *diskCache) error {
 	oldCacheBucketsPath := path.Join(c.dir, minioMetaBucket, "buckets")
 	cacheFormatPath := pathJoin(c.dir, minioMetaBucket, formatConfigFile)
@@ -420,7 +421,7 @@ func migrateOldCache(ctx context.Context, c *diskCache) error {
 			// get old cached metadata
 			oldMetaPath := pathJoin(oldCacheBucketsPath, bucket, object, cacheMetaJSONFile)
 			metaPath := pathJoin(destdir, cacheMetaJSONFile)
-			metaBytes, err := ioutil.ReadFile(oldMetaPath)
+			metaBytes, err := os.ReadFile(oldMetaPath)
 			if err != nil {
 				return err
 			}
@@ -458,7 +459,7 @@ func migrateOldCache(ctx context.Context, c *diskCache) error {
 				return err
 			}
 
-			if err = ioutil.WriteFile(metaPath, jsonData, 0o644); err != nil {
+			if err = os.WriteFile(metaPath, jsonData, 0o644); err != nil {
 				return err
 			}
 		}
@@ -478,7 +479,7 @@ func migrateOldCache(ctx context.Context, c *diskCache) error {
 
 func migrateCacheFormatJSON(cacheFormatPath string) error {
 	// now migrate format.json
-	f, err := os.OpenFile(cacheFormatPath, os.O_RDWR, 0)
+	f, err := os.OpenFile(cacheFormatPath, os.O_RDWR, 0o666)
 	if err != nil {
 		return err
 	}

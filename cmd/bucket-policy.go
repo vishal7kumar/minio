@@ -27,6 +27,8 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
+	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
@@ -38,7 +40,8 @@ type PolicySys struct{}
 
 // Get returns stored bucket policy
 func (sys *PolicySys) Get(bucket string) (*policy.Policy, error) {
-	return globalBucketMetadataSys.GetPolicyConfig(bucket)
+	policy, _, err := globalBucketMetadataSys.GetPolicyConfig(bucket)
+	return policy, err
 }
 
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
@@ -63,8 +66,19 @@ func NewPolicySys() *PolicySys {
 	return &PolicySys{}
 }
 
-func getConditionValues(r *http.Request, lc string, username string, claims map[string]interface{}) map[string][]string {
+func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
 	currTime := UTCNow()
+
+	var (
+		username = cred.AccessKey
+		claims   = cred.Claims
+		groups   = cred.Groups
+	)
+
+	if cred.IsTemp() || cred.IsServiceAccount() {
+		// For derived credentials, check the parent user's permissions.
+		username = cred.ParentUser
+	}
 
 	principalType := "Anonymous"
 	if username != "" {
@@ -124,6 +138,20 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 
 	cloneHeader := r.Header.Clone()
 
+	if userTags := cloneHeader.Get(xhttp.AmzObjectTagging); userTags != "" {
+		tag, _ := tags.ParseObjectTags(userTags)
+		if tag != nil {
+			tagMap := tag.ToMap()
+			keys := make([]string, 0, len(tagMap))
+			for k, v := range tagMap {
+				args[pathJoin("ExistingObjectTag", k)] = []string{v}
+				args[pathJoin("RequestObjectTag", k)] = []string{v}
+				keys = append(keys, k)
+			}
+			args["RequestObjectTagKeys"] = keys
+		}
+	}
+
 	for _, objLock := range []string{
 		xhttp.AmzObjectLockMode,
 		xhttp.AmzObjectLockLegalHold,
@@ -136,6 +164,9 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 	}
 
 	for key, values := range cloneHeader {
+		if strings.EqualFold(key, xhttp.AmzObjectTagging) {
+			continue
+		}
 		if existingValues, found := args[key]; found {
 			args[key] = append(existingValues, values...)
 		} else {
@@ -168,18 +199,36 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 	}
 
 	// JWT specific values
+	//
+	// Add all string claims
 	for k, v := range claims {
 		vStr, ok := v.(string)
 		if ok {
-			// Special case for AD/LDAP STS users
-			switch k {
-			case ldapUser:
-				args["user"] = []string{vStr}
-			case ldapUserN:
-				args["username"] = []string{vStr}
-			default:
-				args[k] = []string{vStr}
+			// Trim any LDAP specific prefix
+			args[strings.ToLower(strings.TrimPrefix(k, "ldap"))] = []string{vStr}
+		}
+	}
+
+	// Add groups claim which could be a list. This will ensure that the claim
+	// `jwt:groups` works.
+	if grpsVal, ok := claims["groups"]; ok {
+		if grpsIs, ok := grpsVal.([]interface{}); ok {
+			grps := []string{}
+			for _, gI := range grpsIs {
+				if g, ok := gI.(string); ok {
+					grps = append(grps, g)
+				}
 			}
+			if len(grps) > 0 {
+				args["groups"] = grps
+			}
+		}
+	}
+
+	// if not claim groups are available use the one with auth.Credentials
+	if _, ok := args["groups"]; !ok {
+		if len(groups) > 0 {
+			args["groups"] = groups
 		}
 	}
 

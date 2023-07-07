@@ -25,8 +25,8 @@ import (
 
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/logger/message/log"
 	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/logger/message/log"
 )
 
 // Target implements loggerTarget to send log
@@ -77,7 +77,7 @@ func (c *Target) Send(e interface{}, logKind string) error {
 			if tagString != "" {
 				tagString += ", "
 			}
-			tagString += fmt.Sprintf("%s=%v", key, value)
+			tagString += fmt.Sprintf("%s=%#v", key, value)
 		}
 	}
 
@@ -133,7 +133,7 @@ func (c *Target) Send(e interface{}, logKind string) error {
 		tagString = "\n       " + tagString
 	}
 
-	msg := color.FgRed(color.Bold(entry.Trace.Message))
+	msg := color.RedBold(entry.Trace.Message)
 	output := fmt.Sprintf("\n%s\n%s%s%s%s%s%s\nError: %s%s\n%s",
 		apiString, timeString, deploymentID, requestID, remoteHost, host, userAgent,
 		msg, tagString, strings.Join(trace, "\n"))

@@ -63,7 +63,52 @@ Similarly to suspend versioning set the configuration with Status set to `Suspen
 </VersioningConfiguration>
 ```
 
-Only users with explicit permissions or the root credential can configure the versioning state of any bucket.
+## MinIO extension to Bucket Versioning
+
+### Idempotent versions on directory objects
+
+All directory objects such as objects that end with `/`, will only have one versionId (i.e `null`). A delete marker will never be created on these directory objects, instead a DELETE will delete the directory objects. This is done to ensure that directory objects even with multiple overwrites - do not ever need multiple versions in the first place. All overwrite calls on these directory objects are idempotent.
+
+> NOTE: Server side replication is supported for idempotent versions on directory objects.
+
+### Idempotent versions on delete markers
+
+Duplicate delete markers are not created on MinIO buckets with versioning, if an application performs a soft delete on an object repeatedly - that object will only ever have a single DELETE marker for all such successive attempts. This is done to ensure that repeated soft deletes do not ever need multiple versions in the first place.
+
+> NOTE: Server side replication is supported for idempotent versions on delete marked objects.
+
+### Motivation
+
+**PLEASE READ: This feature is meant for advanced usecases only where the setup is using bucket versioning or with replicated buckets, use this feature to optimize versioning behavior for some specific applications. MinIO experts will evaluate and guide on the benefits for your application, please reach out to us on <https://subnet.min.io>.**
+
+Spark/Hadoop workloads which use Hadoop MR Committer v1/v2 algorithm upload objects to a temporary prefix in a bucket. These objects are 'renamed' to a different prefix on Job commit. Object storage admins are forced to configure separate ILM policies to expire these objects and their versions to reclaim space.
+
+### Solution
+
+To exclude objects under a list of prefix (glob) patterns from being versioned, you can send the following versioning configuration with Status set to `Enabled`.
+
+```
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        <Status>Enabled</Status>
+        <ExcludedPrefixes>
+          <Prefix>*/_temporary</Prefix>
+        </ExcludedPrefixes>
+        <ExcludedPrefixes>
+          <Prefix>*/__magic</Prefix>
+        </ExcludedPrefixes>
+        <ExcludedPrefixes>
+          <Prefix>*/_staging</Prefix>
+        </ExcludedPrefixes>
+
+        <!-- .. up to 10 prefixes in all -->
+</VersioningConfiguration>
+```
+
+### Features
+
+- Objects matching these prefixes will behave as though versioning were suspended. These objects **will not** be replicated if bucket has replication configured.
+- Objects matching these prefixes will also not leave `null` delete markers, dramatically reduces namespace pollution while keeping the benefits of replication.
+- Users with explicit permissions or the root credential can configure the versioning state of any bucket.
 
 ## Examples of enabling bucket versioning using MinIO Java SDK
 
@@ -166,7 +211,7 @@ public class IsVersioningEnabled {
 
 ## Explore Further
 
-- [Use `minio-java` SDK with MinIO Server](https://docs.minio.io/docs/java-client-quickstart-guide.html)
-- [Object Lock and Immutablity Guide](https://docs.minio.io/docs/minio-bucket-object-lock-guide.html)
-- [MinIO Admin Complete Guide](https://docs.min.io/docs/minio-admin-complete-guide.html)
-- [The MinIO documentation website](https://docs.min.io)
+- [Use `minio-java` SDK with MinIO Server](https://min.io/docs/minio/linux/developers/java/minio-java.html)
+- [Object Lock and Immutablity Guide](https://min.io/docs/minio/linux/administration/object-management/object-retention.html)
+- [MinIO Admin Complete Guide](https://min.io/docs/minio/linux/reference/minio-mc-admin.html)
+- [The MinIO documentation website](https://min.io/docs/minio/linux/index.html)

@@ -18,7 +18,8 @@
 package cmd
 
 const (
-	peerRESTVersion       = "v21" // Add netperf
+	peerRESTVersion = "v30" // Removed bloom filter
+
 	peerRESTVersionPrefix = SlashSeparator + peerRESTVersion
 	peerRESTPrefix        = minioReservedBucketPath + "/peer"
 	peerRESTPath          = peerRESTPrefix + peerRESTVersionPrefix
@@ -27,8 +28,7 @@ const (
 const (
 	peerRESTMethodHealth                      = "/health"
 	peerRESTMethodServerInfo                  = "/serverinfo"
-	peerRESTMethodDriveInfo                   = "/driveinfo"
-	peerRESTMethodNetInfo                     = "/netinfo"
+	peerRESTMethodLocalStorageInfo            = "/localstorageinfo"
 	peerRESTMethodCPUInfo                     = "/cpuinfo"
 	peerRESTMethodDiskHwInfo                  = "/diskhwinfo"
 	peerRESTMethodOsInfo                      = "/osinfo"
@@ -37,11 +37,12 @@ const (
 	peerRESTMethodSysErrors                   = "/syserrors"
 	peerRESTMethodSysServices                 = "/sysservices"
 	peerRESTMethodSysConfig                   = "/sysconfig"
-	peerRESTMethodDispatchNetInfo             = "/dispatchnetinfo"
 	peerRESTMethodDeleteBucketMetadata        = "/deletebucketmetadata"
 	peerRESTMethodLoadBucketMetadata          = "/loadbucketmetadata"
 	peerRESTMethodGetBucketStats              = "/getbucketstats"
-	peerRESTMethodServerUpdate                = "/serverupdate"
+	peerRESTMethodGetAllBucketStats           = "/getallbucketstats"
+	peerRESTMethodDownloadBinary              = "/downloadbinary"
+	peerRESTMethodCommitBinary                = "/commitbinary"
 	peerRESTMethodSignalService               = "/signalservice"
 	peerRESTMethodBackgroundHealStatus        = "/backgroundhealstatus"
 	peerRESTMethodGetLocks                    = "/getlocks"
@@ -65,13 +66,16 @@ const (
 	peerRESTMethodUpdateMetacacheListing      = "/updatemetacache"
 	peerRESTMethodGetPeerMetrics              = "/peermetrics"
 	peerRESTMethodLoadTransitionTierConfig    = "/loadtransitiontierconfig"
-	peerRESTMethodSpeedtest                   = "/speedtest"
+	peerRESTMethodSpeedTest                   = "/speedtest"
 	peerRESTMethodDriveSpeedTest              = "/drivespeedtest"
 	peerRESTMethodReloadSiteReplicationConfig = "/reloadsitereplicationconfig"
 	peerRESTMethodReloadPoolMeta              = "/reloadpoolmeta"
+	peerRESTMethodLoadRebalanceMeta           = "/loadrebalancemeta"
+	peerRESTMethodStopRebalance               = "/stoprebalance"
 	peerRESTMethodGetLastDayTierStats         = "/getlastdaytierstats"
 	peerRESTMethodDevNull                     = "/devnull"
 	peerRESTMethodNetperf                     = "/netperf"
+	peerRESTMethodMetrics                     = "/metrics"
 )
 
 const (
@@ -82,19 +86,20 @@ const (
 	peerRESTUserTemp       = "user-temp"
 	peerRESTPolicy         = "policy"
 	peerRESTUserOrGroup    = "user-or-group"
+	peerRESTUserType       = "user-type"
 	peerRESTIsGroup        = "is-group"
 	peerRESTSignal         = "signal"
+	peerRESTSubSys         = "sub-sys"
 	peerRESTProfiler       = "profiler"
-	peerRESTTraceErr       = "err"
-	peerRESTTraceInternal  = "internal"
-	peerRESTTraceStorage   = "storage"
-	peerRESTTraceS3        = "s3"
-	peerRESTTraceOS        = "os"
-	peerRESTTraceThreshold = "threshold"
 	peerRESTSize           = "size"
 	peerRESTConcurrent     = "concurrent"
 	peerRESTDuration       = "duration"
 	peerRESTStorageClass   = "storage-class"
+	peerRESTMetricsTypes   = "types"
+	peerRESTDisk           = "disk"
+	peerRESTJobID          = "job-id"
+	peerRESTDepID          = "depID"
+	peerRESTStartRebalance = "start-rebalance"
 
 	peerRESTListenBucket = "bucket"
 	peerRESTListenPrefix = "prefix"

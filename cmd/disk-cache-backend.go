@@ -27,7 +27,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path"
@@ -38,6 +37,7 @@ import (
 	"time"
 
 	"github.com/djherbis/atime"
+	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/disk"
@@ -132,17 +132,14 @@ func (m *cacheMeta) ToObjectInfo() (o ObjectInfo) {
 	} else {
 		o.StorageClass = globalMinioDefaultStorageClass
 	}
-	var (
-		t time.Time
-		e error
-	)
+
 	if exp, ok := meta["expires"]; ok {
-		if t, e = time.Parse(http.TimeFormat, exp); e == nil {
+		if t, e := amztime.ParseHeader(exp); e == nil {
 			o.Expires = t.UTC()
 		}
 	}
 	if mtime, ok := meta["last-modified"]; ok {
-		if t, e = time.Parse(http.TimeFormat, mtime); e == nil {
+		if t, e := amztime.ParseHeader(mtime); e == nil {
 			o.ModTime = t.UTC()
 		}
 	}
@@ -515,7 +512,7 @@ func (c *diskCache) statCachedMeta(ctx context.Context, cacheObjPath string) (me
 		return
 	}
 	ctx = lkctx.Context()
-	defer cLock.RUnlock(lkctx.Cancel)
+	defer cLock.RUnlock(lkctx)
 	return c.statCache(ctx, cacheObjPath)
 }
 
@@ -600,7 +597,7 @@ func (c *diskCache) SaveMetadata(ctx context.Context, bucket, object string, met
 		return err
 	}
 	ctx = lkctx.Context()
-	defer cLock.Unlock(lkctx.Cancel)
+	defer cLock.Unlock(lkctx)
 	if err = c.saveMetadata(ctx, bucket, object, meta, actualSize, rs, rsFileName, incHitsOnly); err != nil {
 		return err
 	}
@@ -624,7 +621,7 @@ func (c *diskCache) saveMetadata(ctx context.Context, bucket, object string, met
 	if err := os.MkdirAll(cachedPath, 0o777); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0o666)
+	f, err := OpenFile(metaPath, os.O_RDWR|os.O_CREATE|writeMode, 0o666)
 	if err != nil {
 		return err
 	}
@@ -687,7 +684,7 @@ func (c *diskCache) updateMetadata(ctx context.Context, bucket, object, etag str
 	if err := os.MkdirAll(cachedPath, 0o777); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(metaPath, os.O_RDWR, 0o666)
+	f, err := OpenFile(metaPath, os.O_RDWR|writeMode, 0o666)
 	if err != nil {
 		return err
 	}
@@ -709,7 +706,7 @@ func (c *diskCache) updateMetadata(ctx context.Context, bucket, object, etag str
 
 	if globalCacheKMS != nil {
 		// Calculating object encryption key
-		key, err = decryptObjectInfo(key, bucket, object, m.Meta)
+		key, err = decryptObjectMeta(key, bucket, object, m.Meta)
 		if err != nil {
 			return err
 		}
@@ -797,25 +794,25 @@ func (c *diskCache) bitrotWriteToCache(cachePath, fileName string, reader io.Rea
 	return bytesWritten, base64.StdEncoding.EncodeToString(md5sumCurr), nil
 }
 
-func newCacheEncryptReader(content io.Reader, bucket, object string, metadata map[string]string) (r io.Reader, err error) {
-	objectEncryptionKey, err := newCacheEncryptMetadata(bucket, object, metadata)
+func newCacheEncryptReader(ctx context.Context, content io.Reader, bucket, object string, metadata map[string]string) (r io.Reader, err error) {
+	objectEncryptionKey, err := newCacheEncryptMetadata(ctx, bucket, object, metadata)
 	if err != nil {
 		return nil, err
 	}
 
-	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey, MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey, MinVersion: sio.Version20, CipherSuites: fips.DARECiphers()})
 	if err != nil {
 		return nil, crypto.ErrInvalidCustomerKey
 	}
 	return reader, nil
 }
 
-func newCacheEncryptMetadata(bucket, object string, metadata map[string]string) ([]byte, error) {
+func newCacheEncryptMetadata(ctx context.Context, bucket, object string, metadata map[string]string) ([]byte, error) {
 	var sealedKey crypto.SealedKey
 	if globalCacheKMS == nil {
 		return nil, errKMSNotConfigured
 	}
-	key, err := globalCacheKMS.GenerateKey("", kms.Context{bucket: pathJoin(bucket, object)})
+	key, err := globalCacheKMS.GenerateKey(ctx, "", kms.Context{bucket: pathJoin(bucket, object)})
 	if err != nil {
 		return nil, err
 	}
@@ -845,7 +842,7 @@ func (c *diskCache) Put(ctx context.Context, bucket, object string, data io.Read
 		return oi, err
 	}
 	ctx = lkctx.Context()
-	defer cLock.Unlock(lkctx.Cancel)
+	defer cLock.Unlock(lkctx)
 
 	return c.put(ctx, bucket, object, data, size, rs, opts, incHitsOnly, writeback)
 }
@@ -853,7 +850,7 @@ func (c *diskCache) Put(ctx context.Context, bucket, object string, data io.Read
 // Caches the object to disk
 func (c *diskCache) put(ctx context.Context, bucket, object string, data io.Reader, size int64, rs *HTTPRangeSpec, opts ObjectOptions, incHitsOnly, writeback bool) (oi ObjectInfo, err error) {
 	if !c.diskSpaceAvailable(size) {
-		io.Copy(ioutil.Discard, data)
+		io.Copy(io.Discard, data)
 		return oi, errDiskFull
 	}
 	cachePath := getCacheSHADir(c.dir, bucket, object)
@@ -884,14 +881,16 @@ func (c *diskCache) put(ctx context.Context, bucket, object string, data io.Read
 	}
 
 	if err := os.MkdirAll(cachePath, 0o777); err != nil {
+		removeAll(cachePath)
 		return oi, err
 	}
 	metadata := cloneMSS(opts.UserDefined)
 	reader := data
 	actualSize := uint64(size)
 	if globalCacheKMS != nil {
-		reader, err = newCacheEncryptReader(data, bucket, object, metadata)
+		reader, err = newCacheEncryptReader(ctx, data, bucket, object, metadata)
 		if err != nil {
+			removeAll(cachePath)
 			return oi, err
 		}
 		actualSize, _ = sio.EncryptedSize(uint64(size))
@@ -946,7 +945,7 @@ func (c *diskCache) putRange(ctx context.Context, bucket, object string, data io
 	// objSize is the actual size of object (with encryption overhead if any)
 	objSize := uint64(size)
 	if globalCacheKMS != nil {
-		reader, err = newCacheEncryptReader(data, bucket, object, metadata)
+		reader, err = newCacheEncryptReader(ctx, data, bucket, object, metadata)
 		if err != nil {
 			return err
 		}
@@ -954,7 +953,7 @@ func (c *diskCache) putRange(ctx context.Context, bucket, object string, data io
 		objSize, _ = sio.EncryptedSize(uint64(size))
 
 	}
-	cacheFile := MustGetUUID()
+	cacheFile := mustGetUUID()
 	n, _, err := c.bitrotWriteToCache(cachePath, cacheFile, reader, actualSize)
 	if IsErr(err, baseErrs...) {
 		// take the cache drive offline
@@ -1004,6 +1003,7 @@ func (c *diskCache) bitrotReadFromCache(ctx context.Context, filePath string, of
 	if err != nil {
 		return err
 	}
+	defer rc.Close()
 	bufp := c.pool.Get().(*[]byte)
 	defer c.pool.Put(bufp)
 
@@ -1076,7 +1076,7 @@ func (c *diskCache) Get(ctx context.Context, bucket, object string, rs *HTTPRang
 		return nil, numHits, err
 	}
 	ctx = lkctx.Context()
-	defer cLock.RUnlock(lkctx.Cancel)
+	defer cLock.RUnlock(lkctx)
 
 	var objInfo ObjectInfo
 	var rngInfo RangeInfo
@@ -1213,7 +1213,7 @@ func (c *diskCache) Delete(ctx context.Context, bucket, object string) (err erro
 	if err != nil {
 		return err
 	}
-	defer cLock.Unlock(lkctx.Cancel)
+	defer cLock.Unlock(lkctx)
 	return removeAll(cacheObjPath)
 }
 
@@ -1273,12 +1273,12 @@ func (c *diskCache) NewMultipartUpload(ctx context.Context, bucket, object, uID 
 
 	cachePath := getMultipartCacheSHADir(c.dir, bucket, object)
 	uploadIDDir := path.Join(cachePath, uploadID)
-	if err := os.MkdirAll(uploadIDDir, 0o777); err != nil {
+	if err := mkdirAll(uploadIDDir, 0o777); err != nil {
 		return uploadID, err
 	}
 	metaPath := pathJoin(uploadIDDir, cacheMetaJSONFile)
 
-	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0o666)
+	f, err := OpenFile(metaPath, os.O_RDWR|os.O_CREATE|writeMode, 0o666)
 	if err != nil {
 		return uploadID, err
 	}
@@ -1299,7 +1299,7 @@ func (c *diskCache) NewMultipartUpload(ctx context.Context, bucket, object, uID 
 	m.Stat.ModTime = UTCNow()
 	if globalCacheKMS != nil {
 		m.Meta[ReservedMetadataPrefix+"Encrypted-Multipart"] = ""
-		if _, err := newCacheEncryptMetadata(bucket, object, m.Meta); err != nil {
+		if _, err := newCacheEncryptMetadata(ctx, bucket, object, m.Meta); err != nil {
 			return uploadID, err
 		}
 	}
@@ -1311,7 +1311,7 @@ func (c *diskCache) NewMultipartUpload(ctx context.Context, bucket, object, uID 
 func (c *diskCache) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data io.Reader, size int64, opts ObjectOptions) (partInfo PartInfo, err error) {
 	oi := PartInfo{}
 	if !c.diskSpaceAvailable(size) {
-		io.Copy(ioutil.Discard, data)
+		io.Copy(io.Discard, data)
 		return oi, errDiskFull
 	}
 	cachePath := getMultipartCacheSHADir(c.dir, bucket, object)
@@ -1324,7 +1324,7 @@ func (c *diskCache) PutObjectPart(ctx context.Context, bucket, object, uploadID 
 	}
 
 	ctx = lkctx.Context()
-	defer partIDLock.Unlock(lkctx.Cancel)
+	defer partIDLock.Unlock(lkctx)
 	meta, _, _, err := c.statCache(ctx, uploadIDDir)
 	// Case where object not yet cached
 	if err != nil {
@@ -1381,10 +1381,10 @@ func (c *diskCache) SavePartMetadata(ctx context.Context, bucket, object, upload
 	if err != nil {
 		return err
 	}
-	defer uploadLock.Unlock(ulkctx.Cancel)
+	defer uploadLock.Unlock(ulkctx)
 
 	metaPath := pathJoin(uploadDir, cacheMetaJSONFile)
-	f, err := os.OpenFile(metaPath, os.O_RDWR, 0o666)
+	f, err := OpenFile(metaPath, os.O_RDWR|writeMode, 0o666)
 	if err != nil {
 		return err
 	}
@@ -1398,7 +1398,7 @@ func (c *diskCache) SavePartMetadata(ctx context.Context, bucket, object, upload
 	var objectEncryptionKey crypto.ObjectKey
 	if globalCacheKMS != nil {
 		// Calculating object encryption key
-		key, err = decryptObjectInfo(key, bucket, object, m.Meta)
+		key, err = decryptObjectMeta(key, bucket, object, m.Meta)
 		if err != nil {
 			return err
 		}
@@ -1428,7 +1428,7 @@ func newCachePartEncryptReader(ctx context.Context, bucket, object string, partI
 	var objectEncryptionKey, partEncryptionKey crypto.ObjectKey
 
 	// Calculating object encryption key
-	key, err = decryptObjectInfo(key, bucket, object, metadata)
+	key, err = decryptObjectMeta(key, bucket, object, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -1452,7 +1452,7 @@ func newCachePartEncryptReader(ctx context.Context, bucket, object string, partI
 		return nil, err
 	}
 
-	reader, err := sio.EncryptReader(content, sio.Config{Key: partEncryptionKey[:], MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	reader, err := sio.EncryptReader(content, sio.Config{Key: partEncryptionKey[:], MinVersion: sio.Version20, CipherSuites: fips.DARECiphers()})
 	if err != nil {
 		return nil, crypto.ErrInvalidCustomerKey
 	}
@@ -1463,7 +1463,7 @@ func newCachePartEncryptReader(ctx context.Context, bucket, object string, partI
 func (c *diskCache) uploadIDExists(bucket, object, uploadID string) (err error) {
 	mpartCachePath := getMultipartCacheSHADir(c.dir, bucket, object)
 	uploadIDDir := path.Join(mpartCachePath, uploadID)
-	if _, err := os.Stat(uploadIDDir); err != nil {
+	if _, err := Stat(uploadIDDir); err != nil {
 		return err
 	}
 	return nil
@@ -1480,7 +1480,7 @@ func (c *diskCache) CompleteMultipartUpload(ctx context.Context, bucket, object,
 	}
 
 	ctx = lkctx.Context()
-	defer cLock.Unlock(lkctx.Cancel)
+	defer cLock.Unlock(lkctx)
 	mpartCachePath := getMultipartCacheSHADir(c.dir, bucket, object)
 	uploadIDDir := path.Join(mpartCachePath, uploadID)
 
@@ -1562,7 +1562,7 @@ func (c *diskCache) CompleteMultipartUpload(ctx context.Context, bucket, object,
 	uploadMeta.Hits++
 	metaPath := pathJoin(uploadIDDir, cacheMetaJSONFile)
 
-	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0o666)
+	f, err := OpenFile(metaPath, os.O_RDWR|os.O_CREATE|writeMode, 0o666)
 	if err != nil {
 		return oi, err
 	}
@@ -1628,13 +1628,11 @@ func (c *diskCache) cleanupStaleUploads(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			// Reset for the next interval
-			timer.Reset(cacheStaleUploadCleanupInterval)
 			now := time.Now()
 			readDirFn(pathJoin(c.dir, minioMetaBucket, cacheMultipartDir), func(shaDir string, typ os.FileMode) error {
 				return readDirFn(pathJoin(c.dir, minioMetaBucket, cacheMultipartDir, shaDir), func(uploadIDDir string, typ os.FileMode) error {
 					uploadIDPath := pathJoin(c.dir, minioMetaBucket, cacheMultipartDir, shaDir, uploadIDDir)
-					fi, err := os.Stat(uploadIDPath)
+					fi, err := Stat(uploadIDPath)
 					if err != nil {
 						return nil
 					}
@@ -1649,8 +1647,8 @@ func (c *diskCache) cleanupStaleUploads(ctx context.Context) {
 			readDirFn(pathJoin(c.dir, minioMetaBucket, cacheWritebackDir), func(shaDir string, typ os.FileMode) error {
 				wbdir := pathJoin(c.dir, minioMetaBucket, cacheWritebackDir, shaDir)
 				cachedir := pathJoin(c.dir, shaDir)
-				if _, err := os.Stat(cachedir); os.IsNotExist(err) {
-					fi, err := os.Stat(wbdir)
+				if _, err := Stat(cachedir); os.IsNotExist(err) {
+					fi, err := Stat(wbdir)
 					if err != nil {
 						return nil
 					}
@@ -1660,6 +1658,9 @@ func (c *diskCache) cleanupStaleUploads(ctx context.Context) {
 				}
 				return nil
 			})
+
+			// Reset for the next interval
+			timer.Reset(cacheStaleUploadCleanupInterval)
 		}
 	}
 }

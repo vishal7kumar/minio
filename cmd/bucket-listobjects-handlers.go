@@ -23,9 +23,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/mux"
 
 	"github.com/minio/pkg/bucket/policy"
 )
@@ -33,10 +32,10 @@ import (
 // Validate all the ListObjects query arguments, returns an APIErrorCode
 // if one of the args do not meet the required conditions.
 // Special conditions required by MinIO server are as below
-// - delimiter if set should be equal to '/', otherwise the request is rejected.
-// - marker if set should have a common prefix with 'prefix' param, otherwise
-//   the request is rejected.
-func validateListObjectsArgs(marker, delimiter, encodingType string, maxKeys int) APIErrorCode {
+//   - delimiter if set should be equal to '/', otherwise the request is rejected.
+//   - marker if set should have a common prefix with 'prefix' param, otherwise
+//     the request is rejected.
+func validateListObjectsArgs(prefix, marker, delimiter, encodingType string, maxKeys int) APIErrorCode {
 	// Max keys cannot be negative.
 	if maxKeys < 0 {
 		return ErrInvalidMaxKeys
@@ -49,13 +48,29 @@ func validateListObjectsArgs(marker, delimiter, encodingType string, maxKeys int
 		}
 	}
 
+	if !IsValidObjectPrefix(prefix) {
+		return ErrInvalidObjectName
+	}
+
+	if marker != "" && !HasPrefix(marker, prefix) {
+		return ErrNotImplemented
+	}
+
 	return ErrNone
 }
 
-// ListObjectVersions - GET Bucket Object versions
+func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r *http.Request) {
+	api.listObjectVersionsHandler(w, r, false)
+}
+
+func (api objectAPIHandlers) ListObjectVersionsMHandler(w http.ResponseWriter, r *http.Request) {
+	api.listObjectVersionsHandler(w, r, true)
+}
+
+// ListObjectVersionsHandler - GET Bucket Object versions
 // You can use the versions subresource to list metadata about all
 // of the versions of objects in a bucket.
-func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r *http.Request) {
+func (api objectAPIHandlers) listObjectVersionsHandler(w http.ResponseWriter, r *http.Request, metadata bool) {
 	ctx := newContext(r, w, "ListObjectVersions")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
@@ -73,7 +88,12 @@ func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r 
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
-
+	var checkObjMeta metaCheckFn
+	if metadata {
+		checkObjMeta = func(name string, action policy.Action) (s3Err APIErrorCode) {
+			return checkRequestAuthType(ctx, r, action, bucket, name)
+		}
+	}
 	urlValues := r.Form
 
 	// Extract all the listBucketVersions query params to their native values.
@@ -84,7 +104,7 @@ func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r 
 	}
 
 	// Validate the query params before beginning to serve the request.
-	if s3Error := validateListObjectsArgs(marker, delimiter, encodingType, maxkeys); s3Error != ErrNone {
+	if s3Error := validateListObjectsArgs(prefix, marker, delimiter, encodingType, maxkeys); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -100,15 +120,14 @@ func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	if err = DecryptETags(ctx, GlobalKMS, listObjectVersionsInfo.Objects, kms.BatchSize()); err != nil {
+	if err = DecryptETags(ctx, GlobalKMS, listObjectVersionsInfo.Objects); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-
-	response := generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType, maxkeys, listObjectVersionsInfo)
+	response := generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType, maxkeys, listObjectVersionsInfo, checkObjMeta)
 
 	// Write success response.
-	writeSuccessResponseXML(w, encodeResponse(response))
+	writeSuccessResponseXML(w, encodeResponseList(response))
 }
 
 // ListObjectsV2MHandler - GET Bucket (List Objects) Version 2 with metadata.
@@ -121,64 +140,7 @@ func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r 
 // MinIO continues to support ListObjectsV1 and V2 for supporting legacy tools.
 func (api objectAPIHandlers) ListObjectsV2MHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ListObjectsV2M")
-
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	vars := mux.Vars(r)
-	bucket := vars["bucket"]
-
-	objectAPI := api.ObjectAPI()
-	if objectAPI == nil {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
-		return
-	}
-
-	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketAction, bucket, ""); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
-		return
-	}
-
-	urlValues := r.Form
-
-	// Extract all the listObjectsV2 query params to their native values.
-	prefix, token, startAfter, delimiter, fetchOwner, maxKeys, encodingType, errCode := getListObjectsV2Args(urlValues)
-	if errCode != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(errCode), r.URL)
-		return
-	}
-
-	// Validate the query params before beginning to serve the request.
-	// fetch-owner is not validated since it is a boolean
-	if s3Error := validateListObjectsArgs(token, delimiter, encodingType, maxKeys); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
-		return
-	}
-
-	listObjectsV2 := objectAPI.ListObjectsV2
-
-	// Inititate a list objects operation based on the input params.
-	// On success would return back ListObjectsInfo object to be
-	// marshaled into S3 compatible XML header.
-	listObjectsV2Info, err := listObjectsV2(ctx, bucket, prefix, token, delimiter, maxKeys, fetchOwner, startAfter)
-	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
-
-	if err = DecryptETags(ctx, GlobalKMS, listObjectsV2Info.Objects, kms.BatchSize()); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
-
-	// The next continuation token has id@node_index format to optimize paginated listing
-	nextContinuationToken := listObjectsV2Info.NextContinuationToken
-
-	response := generateListObjectsV2Response(bucket, prefix, token, nextContinuationToken, startAfter,
-		delimiter, encodingType, fetchOwner, listObjectsV2Info.IsTruncated,
-		maxKeys, listObjectsV2Info.Objects, listObjectsV2Info.Prefixes, true)
-
-	// Write success response.
-	writeSuccessResponseXML(w, encodeResponse(response))
+	api.listObjectsV2Handler(ctx, w, r, true)
 }
 
 // ListObjectsV2Handler - GET Bucket (List Objects) Version 2.
@@ -191,7 +153,11 @@ func (api objectAPIHandlers) ListObjectsV2MHandler(w http.ResponseWriter, r *htt
 // MinIO continues to support ListObjectsV1 for supporting legacy tools.
 func (api objectAPIHandlers) ListObjectsV2Handler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ListObjectsV2")
+	api.listObjectsV2Handler(ctx, w, r, false)
+}
 
+// listObjectsV2Handler performs listing either with or without extra metadata.
+func (api objectAPIHandlers) listObjectsV2Handler(ctx context.Context, w http.ResponseWriter, r *http.Request, metadata bool) {
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
@@ -208,6 +174,12 @@ func (api objectAPIHandlers) ListObjectsV2Handler(w http.ResponseWriter, r *http
 		return
 	}
 
+	var checkObjMeta metaCheckFn
+	if metadata {
+		checkObjMeta = func(name string, action policy.Action) (s3Err APIErrorCode) {
+			return checkRequestAuthType(ctx, r, action, bucket, name)
+		}
+	}
 	urlValues := r.Form
 
 	// Extract all the listObjectsV2 query params to their native values.
@@ -218,8 +190,7 @@ func (api objectAPIHandlers) ListObjectsV2Handler(w http.ResponseWriter, r *http
 	}
 
 	// Validate the query params before beginning to serve the request.
-	// fetch-owner is not validated since it is a boolean
-	if s3Error := validateListObjectsArgs(token, delimiter, encodingType, maxKeys); s3Error != ErrNone {
+	if s3Error := validateListObjectsArgs(prefix, token, delimiter, encodingType, maxKeys); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -243,17 +214,17 @@ func (api objectAPIHandlers) ListObjectsV2Handler(w http.ResponseWriter, r *http
 		return
 	}
 
-	if err = DecryptETags(ctx, GlobalKMS, listObjectsV2Info.Objects, kms.BatchSize()); err != nil {
+	if err = DecryptETags(ctx, GlobalKMS, listObjectsV2Info.Objects); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
 	response := generateListObjectsV2Response(bucket, prefix, token, listObjectsV2Info.NextContinuationToken, startAfter,
 		delimiter, encodingType, fetchOwner, listObjectsV2Info.IsTruncated,
-		maxKeys, listObjectsV2Info.Objects, listObjectsV2Info.Prefixes, false)
+		maxKeys, listObjectsV2Info.Objects, listObjectsV2Info.Prefixes, checkObjMeta)
 
 	// Write success response.
-	writeSuccessResponseXML(w, encodeResponse(response))
+	writeSuccessResponseXML(w, encodeResponseList(response))
 }
 
 func parseRequestToken(token string) (subToken string, nodeIndex int) {
@@ -299,7 +270,6 @@ func proxyRequestByNodeIndex(ctx context.Context, w http.ResponseWriter, r *http
 // This implementation of the GET operation returns some or all (up to 1000)
 // of the objects in a bucket. You can use the request parameters as selection
 // criteria to return a subset of the objects in a bucket.
-//
 func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ListObjectsV1")
 
@@ -327,7 +297,7 @@ func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http
 	}
 
 	// Validate all the query params before beginning to serve the request.
-	if s3Error := validateListObjectsArgs(marker, delimiter, encodingType, maxKeys); s3Error != ErrNone {
+	if s3Error := validateListObjectsArgs(prefix, marker, delimiter, encodingType, maxKeys); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -343,7 +313,7 @@ func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http
 		return
 	}
 
-	if err = DecryptETags(ctx, GlobalKMS, listObjectsInfo.Objects, kms.BatchSize()); err != nil {
+	if err = DecryptETags(ctx, GlobalKMS, listObjectsInfo.Objects); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -351,5 +321,5 @@ func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http
 	response := generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType, maxKeys, listObjectsInfo)
 
 	// Write success response.
-	writeSuccessResponseXML(w, encodeResponse(response))
+	writeSuccessResponseXML(w, encodeResponseList(response))
 }

@@ -40,6 +40,11 @@ func (target ExampleTarget) Save(eventData Event) error {
 	return target.send(eventData)
 }
 
+// Store - Returns a nil store.
+func (target ExampleTarget) Store() TargetStore {
+	return nil
+}
+
 func (target ExampleTarget) send(eventData Event) error {
 	b := make([]byte, 1)
 	if _, err := rand.Read(b); err != nil {
@@ -55,8 +60,8 @@ func (target ExampleTarget) send(eventData Event) error {
 	return nil
 }
 
-// Send - interface compatible method does no-op.
-func (target ExampleTarget) Send(eventKey string) error {
+// SendFromStore - interface compatible method does no-op.
+func (target *ExampleTarget) SendFromStore(eventKey string) error {
 	return nil
 }
 
@@ -72,9 +77,9 @@ func (target ExampleTarget) IsActive() (bool, error) {
 	return false, errors.New("not connected to target server/service")
 }
 
-// HasQueueStore - No-Op. Added for interface compatibility
-func (target ExampleTarget) HasQueueStore() bool {
-	return false
+// FlushQueueStore - No-Op. Added for interface compatibility
+func (target ExampleTarget) FlushQueueStore() error {
+	return nil
 }
 
 func TestTargetListAdd(t *testing.T) {
@@ -244,7 +249,7 @@ func TestTargetListSend(t *testing.T) {
 	for i, testCase := range testCases {
 		testCase.targetList.Send(Event{}, map[TargetID]struct{}{
 			testCase.targetID: {},
-		}, resCh)
+		}, resCh, false)
 		res := <-resCh
 		expectErr := (res.Err != nil)
 

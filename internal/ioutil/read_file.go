@@ -25,12 +25,21 @@ import (
 	"github.com/minio/minio/internal/disk"
 )
 
+var (
+	// OpenFileDirectIO allows overriding default function.
+	OpenFileDirectIO = disk.OpenFileDirectIO
+	// OsOpen allows overriding default function.
+	OsOpen = os.Open
+	// OsOpenFile allows overriding default function.
+	OsOpenFile = os.OpenFile
+)
+
 // ReadFileWithFileInfo reads the named file and returns the contents.
 // A successful call returns err == nil, not err == EOF.
 // Because ReadFile reads the whole file, it does not treat an EOF from Read
-// as an error to be reported, additionall returns os.FileInfo
+// as an error to be reported.
 func ReadFileWithFileInfo(name string) ([]byte, fs.FileInfo, error) {
-	f, err := os.Open(name)
+	f, err := OsOpenFile(name, readMode, 0o666)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -53,15 +62,33 @@ func ReadFileWithFileInfo(name string) ([]byte, fs.FileInfo, error) {
 //
 // passes NOATIME flag for reads on Unix systems to avoid atime updates.
 func ReadFile(name string) ([]byte, error) {
-	f, err := disk.OpenFileDirectIO(name, readMode, 0o666)
+	if !disk.ODirectPlatform {
+		// Don't wrap with un-needed buffer.
+		// Don't use os.ReadFile, since it doesn't pass NO_ATIME when present.
+		f, err := OsOpenFile(name, readMode, 0o666)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		st, err := f.Stat()
+		if err != nil {
+			return io.ReadAll(f)
+		}
+		dst := make([]byte, st.Size())
+		_, err = io.ReadFull(f, dst)
+		return dst, err
+	}
+
+	f, err := OpenFileDirectIO(name, readMode, 0o666)
 	if err != nil {
 		// fallback if there is an error to read
 		// 'name' with O_DIRECT
-		f, err = os.OpenFile(name, readMode, 0o666)
+		f, err = OsOpenFile(name, readMode, 0o666)
 		if err != nil {
 			return nil, err
 		}
 	}
+
 	r := &ODirectReader{
 		File:      f,
 		SmallFile: true,
@@ -72,6 +99,10 @@ func ReadFile(name string) ([]byte, error) {
 	if err != nil {
 		return io.ReadAll(r)
 	}
+
+	// Select bigger blocks when reading would do more than 2 reads.
+	r.SmallFile = st.Size() <= BlockSizeSmall*2
+
 	dst := make([]byte, st.Size())
 	_, err = io.ReadFull(r, dst)
 	return dst, err

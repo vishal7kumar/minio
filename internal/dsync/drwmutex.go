@@ -23,18 +23,40 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/minio/minio/internal/mcontext"
 	"github.com/minio/pkg/console"
 )
 
 // Indicator if logging is enabled.
 var dsyncLog bool
 
+// Retry unit interval
+var lockRetryMinInterval time.Duration
+
+var lockRetryBackOff func(*rand.Rand, uint) time.Duration
+
 func init() {
 	// Check for MINIO_DSYNC_TRACE env variable, if set logging will be enabled for failed REST operations.
-	dsyncLog = os.Getenv("MINIO_DSYNC_TRACE") == "1"
+	dsyncLog = os.Getenv("_MINIO_DSYNC_TRACE") == "1"
+
+	lockRetryMinInterval = 250 * time.Millisecond
+	if lri := os.Getenv("_MINIO_LOCK_RETRY_INTERVAL"); lri != "" {
+		v, err := strconv.Atoi(lri)
+		if err != nil {
+			panic(err)
+		}
+		lockRetryMinInterval = time.Duration(v) * time.Millisecond
+	}
+
+	lockRetryBackOff = backoffWait(
+		lockRetryMinInterval,
+		100*time.Millisecond,
+		5*time.Second,
+	)
 }
 
 func log(format string, data ...interface{}) {
@@ -59,8 +81,6 @@ const (
 	// dRWMutexRefreshInterval - default the interval between two refresh calls
 	drwMutexRefreshInterval = 10 * time.Second
 
-	lockRetryInterval = 1 * time.Second
-
 	drwMutexInfinite = 1<<63 - 1
 )
 
@@ -82,22 +102,22 @@ type Timeouts struct {
 // DefaultTimeouts contains default timeouts.
 var DefaultTimeouts = Timeouts{
 	Acquire:         drwMutexAcquireTimeout,
-	RefreshCall:     drwMutexUnlockCallTimeout,
-	UnlockCall:      drwMutexRefreshCallTimeout,
+	RefreshCall:     drwMutexRefreshCallTimeout,
+	UnlockCall:      drwMutexUnlockCallTimeout,
 	ForceUnlockCall: drwMutexForceUnlockCallTimeout,
 }
 
 // A DRWMutex is a distributed mutual exclusion lock.
 type DRWMutex struct {
-	Names             []string
-	writeLocks        []string // Array of nodes that granted a write lock
-	readLocks         []string // Array of array of nodes that granted reader locks
-	rng               *rand.Rand
-	m                 sync.Mutex // Mutex to prevent multiple simultaneous locks from this node
-	clnt              *Dsync
-	cancelRefresh     context.CancelFunc
-	refreshInterval   time.Duration
-	lockRetryInterval time.Duration
+	Names                []string
+	writeLocks           []string // Array of nodes that granted a write lock
+	readLocks            []string // Array of array of nodes that granted reader locks
+	rng                  *rand.Rand
+	m                    sync.Mutex // Mutex to prevent multiple simultaneous locks from this node
+	clnt                 *Dsync
+	cancelRefresh        context.CancelFunc
+	refreshInterval      time.Duration
+	lockRetryMinInterval time.Duration
 }
 
 // Granted - represents a structure of a granted lock.
@@ -119,13 +139,13 @@ func NewDRWMutex(clnt *Dsync, names ...string) *DRWMutex {
 	restClnts, _ := clnt.GetLockers()
 	sort.Strings(names)
 	return &DRWMutex{
-		writeLocks:        make([]string, len(restClnts)),
-		readLocks:         make([]string, len(restClnts)),
-		Names:             names,
-		clnt:              clnt,
-		rng:               rand.New(&lockedRandSource{src: rand.NewSource(time.Now().UTC().UnixNano())}),
-		refreshInterval:   drwMutexRefreshInterval,
-		lockRetryInterval: lockRetryInterval,
+		writeLocks:           make([]string, len(restClnts)),
+		readLocks:            make([]string, len(restClnts)),
+		Names:                names,
+		clnt:                 clnt,
+		rng:                  rand.New(&lockedRandSource{src: rand.NewSource(time.Now().UTC().UnixNano())}),
+		refreshInterval:      drwMutexRefreshInterval,
+		lockRetryMinInterval: lockRetryMinInterval,
 	}
 }
 
@@ -142,7 +162,8 @@ func (dm *DRWMutex) Lock(id, source string) {
 
 // Options lock options.
 type Options struct {
-	Timeout time.Duration
+	Timeout       time.Duration
+	RetryInterval time.Duration
 }
 
 // GetLock tries to get a write lock on dm before the timeout elapses.
@@ -210,6 +231,7 @@ func (dm *DRWMutex) lockBlocking(ctx context.Context, lockLossCallback func(), i
 	log("lockBlocking %s/%s for %#v: lockType readLock(%t), additional opts: %#v, quorum: %d, tolerance: %d, lockClients: %d\n", id, source, dm.Names, isReadLock, opts, quorum, tolerance, len(restClnts))
 
 	tolerance = len(restClnts) - quorum
+	attempt := uint(0)
 
 	for {
 		select {
@@ -236,7 +258,15 @@ func (dm *DRWMutex) lockBlocking(ctx context.Context, lockLossCallback func(), i
 				return locked
 			}
 
-			time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryInterval)))
+			switch {
+			case opts.RetryInterval < 0:
+				return false
+			case opts.RetryInterval > 0:
+				time.Sleep(opts.RetryInterval)
+			default:
+				attempt++
+				time.Sleep(lockRetryBackOff(dm.rng, attempt))
+			}
 		}
 	}
 }
@@ -259,8 +289,6 @@ func (dm *DRWMutex) startContinousLockRefresh(lockLossCallback func(), id, sourc
 			case <-ctx.Done():
 				return
 			case <-refreshTimer.C:
-				refreshTimer.Reset(dm.refreshInterval)
-
 				noQuorum, err := refreshLock(ctx, dm.clnt, id, source, quorum)
 				if err == nil && noQuorum {
 					// Clean the lock locally and in remote nodes
@@ -271,6 +299,8 @@ func (dm *DRWMutex) startContinousLockRefresh(lockLossCallback func(), id, sourc
 					}
 					return
 				}
+
+				refreshTimer.Reset(dm.refreshInterval)
 			}
 		}
 	}()
@@ -408,6 +438,15 @@ func lock(ctx context.Context, ds *Dsync, locks *[]string, id, source string, is
 	// Combined timeout for the lock attempt.
 	ctx, cancel := context.WithTimeout(ctx, ds.Timeouts.Acquire)
 	defer cancel()
+
+	// Special context for NetLockers - do not use timeouts.
+	// Also, pass the trace context info if found for debugging
+	netLockCtx := context.Background()
+	tc, ok := ctx.Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+	if ok {
+		netLockCtx = context.WithValue(netLockCtx, mcontext.ContextTraceKey, tc)
+	}
+
 	for index, c := range restClnts {
 		wg.Add(1)
 		// broadcast lock request to all nodes
@@ -424,11 +463,11 @@ func lock(ctx context.Context, ds *Dsync, locks *[]string, id, source string, is
 			var locked bool
 			var err error
 			if isReadLock {
-				if locked, err = c.RLock(context.Background(), args); err != nil {
+				if locked, err = c.RLock(netLockCtx, args); err != nil {
 					log("dsync: Unable to call RLock failed with %s for %#v at %s\n", err, args, c)
 				}
 			} else {
-				if locked, err = c.Lock(context.Background(), args); err != nil {
+				if locked, err = c.Lock(netLockCtx, args); err != nil {
 					log("dsync: Unable to call Lock failed with %s for %#v at %s\n", err, args, c)
 				}
 			}
@@ -481,7 +520,7 @@ func lock(ctx context.Context, ds *Dsync, locks *[]string, id, source string, is
 	if !quorumLocked {
 		log("dsync: Unable to acquire lock in quorum %#v\n", args)
 		// Release all acquired locks without quorum.
-		if !releaseAll(ds, tolerance, owner, locks, isReadLock, restClnts, names...) {
+		if !releaseAll(ctx, ds, tolerance, owner, locks, isReadLock, restClnts, names...) {
 			log("Unable to release acquired locks, these locks will expire automatically %#v\n", args)
 		}
 	}
@@ -494,7 +533,7 @@ func lock(ctx context.Context, ds *Dsync, locks *[]string, id, source string, is
 			if grantToBeReleased.isLocked() {
 				// release abandoned lock
 				log("Releasing abandoned lock\n")
-				sendRelease(ds, restClnts[grantToBeReleased.index],
+				sendRelease(ctx, ds, restClnts[grantToBeReleased.index],
 					owner, grantToBeReleased.lockUID, isReadLock, names...)
 			}
 		}
@@ -543,13 +582,13 @@ func checkQuorumLocked(locks *[]string, quorum int) bool {
 }
 
 // releaseAll releases all locks that are marked as locked
-func releaseAll(ds *Dsync, tolerance int, owner string, locks *[]string, isReadLock bool, restClnts []NetLocker, names ...string) bool {
+func releaseAll(ctx context.Context, ds *Dsync, tolerance int, owner string, locks *[]string, isReadLock bool, restClnts []NetLocker, names ...string) bool {
 	var wg sync.WaitGroup
 	for lockID := range restClnts {
 		wg.Add(1)
 		go func(lockID int) {
 			defer wg.Done()
-			if sendRelease(ds, restClnts[lockID], owner, (*locks)[lockID], isReadLock, names...) {
+			if sendRelease(ctx, ds, restClnts[lockID], owner, (*locks)[lockID], isReadLock, names...) {
 				(*locks)[lockID] = ""
 			}
 		}(lockID)
@@ -566,7 +605,7 @@ func releaseAll(ds *Dsync, tolerance int, owner string, locks *[]string, isReadL
 // Unlock unlocks the write lock.
 //
 // It is a run-time error if dm is not locked on entry to Unlock.
-func (dm *DRWMutex) Unlock() {
+func (dm *DRWMutex) Unlock(ctx context.Context) {
 	dm.m.Lock()
 	dm.cancelRefresh()
 	dm.m.Unlock()
@@ -599,15 +638,15 @@ func (dm *DRWMutex) Unlock() {
 	tolerance := len(restClnts) / 2
 
 	isReadLock := false
-	for !releaseAll(dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
-		time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryInterval)))
+	for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
+		time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
 	}
 }
 
 // RUnlock releases a read lock held on dm.
 //
 // It is a run-time error if dm is not locked on entry to RUnlock.
-func (dm *DRWMutex) RUnlock() {
+func (dm *DRWMutex) RUnlock(ctx context.Context) {
 	dm.m.Lock()
 	dm.cancelRefresh()
 	dm.m.Unlock()
@@ -640,13 +679,13 @@ func (dm *DRWMutex) RUnlock() {
 	tolerance := len(restClnts) / 2
 
 	isReadLock := true
-	for !releaseAll(dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
-		time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryInterval)))
+	for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
+		time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
 	}
 }
 
 // sendRelease sends a release message to a node that previously granted a lock
-func sendRelease(ds *Dsync, c NetLocker, owner string, uid string, isReadLock bool, names ...string) bool {
+func sendRelease(ctx context.Context, ds *Dsync, c NetLocker, owner string, uid string, isReadLock bool, names ...string) bool {
 	if c == nil {
 		log("Unable to call RUnlock failed with %s\n", errors.New("netLocker is offline"))
 		return false
@@ -662,16 +701,21 @@ func sendRelease(ds *Dsync, c NetLocker, owner string, uid string, isReadLock bo
 		Resources: names,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), ds.Timeouts.UnlockCall)
+	netLockCtx, cancel := context.WithTimeout(context.Background(), ds.Timeouts.UnlockCall)
 	defer cancel()
 
+	tc, ok := ctx.Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+	if ok {
+		netLockCtx = context.WithValue(netLockCtx, mcontext.ContextTraceKey, tc)
+	}
+
 	if isReadLock {
-		if _, err := c.RUnlock(ctx, args); err != nil {
+		if _, err := c.RUnlock(netLockCtx, args); err != nil {
 			log("dsync: Unable to call RUnlock failed with %s for %#v at %s\n", err, args, c)
 			return false
 		}
 	} else {
-		if _, err := c.Unlock(ctx, args); err != nil {
+		if _, err := c.Unlock(netLockCtx, args); err != nil {
 			log("dsync: Unable to call Unlock failed with %s for %#v at %s\n", err, args, c)
 			return false
 		}

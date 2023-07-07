@@ -19,7 +19,14 @@ package event
 
 import (
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
+)
+
+const (
+	// The maximum allowed number of concurrent Send() calls to all configured notifications targets
+	maxConcurrentTargetSendCalls = 20000
 )
 
 // Target - event target interface
@@ -27,13 +34,35 @@ type Target interface {
 	ID() TargetID
 	IsActive() (bool, error)
 	Save(Event) error
-	Send(string) error
+	SendFromStore(string) error
 	Close() error
-	HasQueueStore() bool
+	Store() TargetStore
+}
+
+// TargetStore is a shallow version of a target.Store
+type TargetStore interface {
+	Len() int
+}
+
+// TargetStats is a collection of stats for multiple targets.
+type TargetStats struct {
+	// CurrentSendCalls is the number of concurrent async Send calls to all targets
+	CurrentSendCalls int64
+
+	TargetStats map[string]TargetStat
+}
+
+// TargetStat is the stats of a single target.
+type TargetStat struct {
+	ID           TargetID
+	CurrentQueue int // Populated if target has a store.
 }
 
 // TargetList - holds list of targets indexed by target ID.
 type TargetList struct {
+	// The number of concurrent async Send calls to all targets
+	currentSendCalls int64
+
 	sync.RWMutex
 	targets map[TargetID]Target
 }
@@ -119,33 +148,75 @@ func (list *TargetList) List() []TargetID {
 func (list *TargetList) TargetMap() map[TargetID]Target {
 	list.RLock()
 	defer list.RUnlock()
-	return list.targets
+
+	ntargets := make(map[TargetID]Target, len(list.targets))
+	for k, v := range list.targets {
+		ntargets[k] = v
+	}
+	return ntargets
 }
 
 // Send - sends events to targets identified by target IDs.
-func (list *TargetList) Send(event Event, targetIDset TargetIDSet, resCh chan<- TargetIDResult) {
-	go func() {
-		var wg sync.WaitGroup
+func (list *TargetList) Send(event Event, targetIDset TargetIDSet, resCh chan<- TargetIDResult, synchronous bool) {
+	if atomic.LoadInt64(&list.currentSendCalls) > maxConcurrentTargetSendCalls {
+		err := fmt.Errorf("concurrent target notifications exceeded %d", maxConcurrentTargetSendCalls)
 		for id := range targetIDset {
-			list.RLock()
-			target, ok := list.targets[id]
-			list.RUnlock()
-			if ok {
-				wg.Add(1)
-				go func(id TargetID, target Target) {
-					defer wg.Done()
-					tgtRes := TargetIDResult{ID: id}
-					if err := target.Save(event); err != nil {
-						tgtRes.Err = err
-					}
-					resCh <- tgtRes
-				}(id, target)
-			} else {
-				resCh <- TargetIDResult{ID: id}
-			}
+			resCh <- TargetIDResult{ID: id, Err: err}
 		}
-		wg.Wait()
+		return
+	}
+	if synchronous {
+		list.send(event, targetIDset, resCh)
+		return
+	}
+	go func() {
+		list.send(event, targetIDset, resCh)
 	}()
+}
+
+func (list *TargetList) send(event Event, targetIDset TargetIDSet, resCh chan<- TargetIDResult) {
+	var wg sync.WaitGroup
+	for id := range targetIDset {
+		list.RLock()
+		target, ok := list.targets[id]
+		list.RUnlock()
+		if ok {
+			wg.Add(1)
+			go func(id TargetID, target Target) {
+				atomic.AddInt64(&list.currentSendCalls, 1)
+				defer atomic.AddInt64(&list.currentSendCalls, -1)
+				defer wg.Done()
+				tgtRes := TargetIDResult{ID: id}
+				if err := target.Save(event); err != nil {
+					tgtRes.Err = err
+				}
+				resCh <- tgtRes
+			}(id, target)
+		} else {
+			resCh <- TargetIDResult{ID: id}
+		}
+	}
+	wg.Wait()
+}
+
+// Stats returns stats for targets.
+func (list *TargetList) Stats() TargetStats {
+	t := TargetStats{}
+	if list == nil {
+		return t
+	}
+	t.CurrentSendCalls = atomic.LoadInt64(&list.currentSendCalls)
+	list.RLock()
+	defer list.RUnlock()
+	t.TargetStats = make(map[string]TargetStat, len(list.targets))
+	for id, target := range list.targets {
+		ts := TargetStat{ID: id}
+		if st := target.Store(); st != nil {
+			ts.CurrentQueue = st.Len()
+		}
+		t.TargetStats[strings.ReplaceAll(id.String(), ":", "_")] = ts
+	}
+	return t
 }
 
 // NewTargetList - creates TargetList.

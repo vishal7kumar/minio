@@ -18,7 +18,6 @@
 package lock
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
@@ -26,7 +25,7 @@ import (
 
 // Test lock fails.
 func TestLockFail(t *testing.T) {
-	f, err := ioutil.TempFile("", "lock")
+	f, err := os.CreateTemp("", "lock")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,18 +45,9 @@ func TestLockFail(t *testing.T) {
 
 // Tests lock directory fail.
 func TestLockDirFail(t *testing.T) {
-	d, err := ioutil.TempDir("", "lockDir")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		err = os.Remove(d)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
+	d := t.TempDir()
 
-	_, err = LockedOpenFile(d, os.O_APPEND, 0o600)
+	_, err := LockedOpenFile(d, os.O_APPEND, 0o600)
 	if err == nil {
 		t.Fatal("Should fail here")
 	}
@@ -65,7 +55,7 @@ func TestLockDirFail(t *testing.T) {
 
 // Tests rwlock methods.
 func TestRWLockedFile(t *testing.T) {
-	f, err := ioutil.TempFile("", "lock")
+	f, err := os.CreateTemp("", "lock")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +118,7 @@ func TestRWLockedFile(t *testing.T) {
 
 // Tests lock and unlock semantics.
 func TestLockAndUnlock(t *testing.T) {
-	f, err := ioutil.TempFile("", "lock")
+	f, err := os.CreateTemp("", "lock")
 	if err != nil {
 		t.Fatal(err)
 	}

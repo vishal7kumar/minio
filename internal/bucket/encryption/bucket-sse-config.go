@@ -22,6 +22,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
@@ -102,8 +103,13 @@ func ParseBucketSSEConfig(r io.Reader) (*BucketSSEConfig, error) {
 				return nil, errors.New("MasterKeyID is allowed with aws:kms only")
 			}
 		case AWSKms:
-			if rule.DefaultEncryptionAction.MasterKeyID == "" {
+			keyID := rule.DefaultEncryptionAction.MasterKeyID
+			if keyID == "" {
 				return nil, errors.New("MasterKeyID is missing with aws:kms")
+			}
+			spaces := strings.HasPrefix(keyID, " ") || strings.HasSuffix(keyID, " ")
+			if spaces {
+				return nil, errors.New("MasterKeyID contains unsupported characters")
 			}
 		}
 	}
@@ -118,7 +124,6 @@ func ParseBucketSSEConfig(r io.Reader) (*BucketSSEConfig, error) {
 // when bucketSSEConfig is empty.
 type ApplyOptions struct {
 	AutoEncrypt bool
-	Passthrough bool // Set to 'true' for S3 gateway mode.
 }
 
 // Apply applies the SSE bucket configuration on the given HTTP headers and
@@ -128,16 +133,12 @@ type ApplyOptions struct {
 // set minimal SSE-KMS headers if autoEncrypt is true and the BucketSSEConfig
 // is nil.
 func (b *BucketSSEConfig) Apply(headers http.Header, opts ApplyOptions) {
-	if _, ok := crypto.IsRequested(headers); ok {
+	if crypto.Requested(headers) {
 		return
 	}
 	if b == nil {
 		if opts.AutoEncrypt {
-			if !opts.Passthrough {
-				headers.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
-			} else {
-				headers.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
-			}
+			headers.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
 		}
 		return
 	}
@@ -164,7 +165,7 @@ func (b *BucketSSEConfig) Algo() Algorithm {
 // empty key ID.
 func (b *BucketSSEConfig) KeyID() string {
 	for _, rule := range b.Rules {
-		return rule.DefaultEncryptionAction.MasterKeyID
+		return strings.TrimPrefix(rule.DefaultEncryptionAction.MasterKeyID, crypto.ARNPrefix)
 	}
 	return ""
 }

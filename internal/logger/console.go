@@ -25,12 +25,15 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/color"
-	"github.com/minio/minio/internal/logger/message/log"
 	c "github.com/minio/pkg/console"
+	"github.com/minio/pkg/logger/message/log"
 )
 
 // ConsoleLoggerTgt is a stringified value to represent console logging
 const ConsoleLoggerTgt = "console+http"
+
+// ExitFunc is called by Fatal() class functions, by default it calls os.Exit()
+var ExitFunc = os.Exit
 
 // Logger interface describes the methods that need to be implemented to satisfy the interface requirements.
 type Logger interface {
@@ -90,7 +93,7 @@ func (f fatalMsg) json(msg string, args ...interface{}) {
 	}
 	fmt.Println(string(logJSON))
 
-	os.Exit(1)
+	ExitFunc(1)
 }
 
 func (f fatalMsg) quiet(msg string, args ...interface{}) {
@@ -143,7 +146,7 @@ func (f fatalMsg) pretty(msg string, args ...interface{}) {
 	}
 
 	// Exit because this is a fatal error message
-	os.Exit(1)
+	ExitFunc(1)
 }
 
 type infoMsg struct{}
@@ -158,7 +161,7 @@ func (i infoMsg) json(msg string, args ...interface{}) {
 		message = fmt.Sprint(args...)
 	}
 	logJSON, err := json.Marshal(&log.Entry{
-		Level:   InformationLvl.String(),
+		Level:   InfoLvl.String(),
 		Message: message,
 		Time:    time.Now().UTC(),
 	})
@@ -214,10 +217,16 @@ func (i errorMsg) pretty(msg string, args ...interface{}) {
 
 // Error :
 func Error(msg string, data ...interface{}) {
+	if MinimumLogLevel > ErrorLvl {
+		return
+	}
 	consoleLog(errorm, msg, data...)
 }
 
 // Info :
 func Info(msg string, data ...interface{}) {
+	if MinimumLogLevel > InfoLvl {
+		return
+	}
 	consoleLog(info, msg, data...)
 }

@@ -21,6 +21,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
+
+	"github.com/minio/minio/internal/auth"
 )
 
 // Key used for Get/SetReqInfo
@@ -41,19 +43,23 @@ type ObjectVersion struct {
 }
 
 // ReqInfo stores the request info.
+// Reading/writing directly to struct requires appropriate R/W lock.
 type ReqInfo struct {
-	RemoteHost   string          // Client Host/IP
-	Host         string          // Node Host/IP
-	UserAgent    string          // User Agent
-	DeploymentID string          // x-minio-deployment-id
-	RequestID    string          // x-amz-request-id
-	API          string          // API name - GetObject PutObject NewMultipartUpload etc.
-	BucketName   string          `json:",omitempty"` // Bucket name
-	ObjectName   string          `json:",omitempty"` // Object name
-	VersionID    string          `json:",omitempty"` // corresponding versionID for the object
-	Objects      []ObjectVersion `json:",omitempty"` // Only set during MultiObject delete handler.
-	AccessKey    string          // Access Key
-	tags         []KeyVal        // Any additional info not accommodated by above fields
+	RemoteHost   string           // Client Host/IP
+	Host         string           // Node Host/IP
+	UserAgent    string           // User Agent
+	DeploymentID string           // x-minio-deployment-id
+	RequestID    string           // x-amz-request-id
+	API          string           // API name - GetObject PutObject NewMultipartUpload etc.
+	BucketName   string           `json:",omitempty"` // Bucket name
+	ObjectName   string           `json:",omitempty"` // Object name
+	VersionID    string           `json:",omitempty"` // corresponding versionID for the object
+	Objects      []ObjectVersion  `json:",omitempty"` // Only set during MultiObject delete handler.
+	Cred         auth.Credentials `json:"-"`
+	Region       string           `json:"-"`
+	Owner        bool             `json:"-"`
+	AuthType     string           `json:"-"`
+	tags         []KeyVal         // Any additional info not accommodated by above fields
 	sync.RWMutex
 }
 
@@ -111,7 +117,7 @@ func (r *ReqInfo) GetTags() []KeyVal {
 	}
 	r.RLock()
 	defer r.RUnlock()
-	return append([]KeyVal(nil), r.tags...)
+	return append(make([]KeyVal, 0, len(r.tags)), r.tags...)
 }
 
 // GetTagsMap - returns the user defined tags in a map structure
@@ -145,7 +151,6 @@ func GetReqInfo(ctx context.Context) *ReqInfo {
 			return r
 		}
 		r = &ReqInfo{}
-		SetReqInfo(ctx, r)
 		return r
 	}
 	return nil

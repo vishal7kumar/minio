@@ -27,19 +27,20 @@ import (
 func TestNewObjectLayer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Tests for FS object layer.
+	// Tests for ErasureSD object layer.
 	nDisks := 1
 	disks, err := getRandomDisks(nDisks)
 	if err != nil {
-		t.Fatal("Failed to create disks for the backend")
+		t.Fatal("Failed to create drives for the backend")
 	}
 	defer removeRoots(disks)
 
-	obj, err := newObjectLayer(ctx, mustGetPoolEndpoints(disks...))
+	obj, err := newObjectLayer(ctx, mustGetPoolEndpoints(0, disks...))
 	if err != nil {
 		t.Fatal("Unexpected object layer initialization error", err)
 	}
-	_, ok := obj.(*FSObjects)
+
+	_, ok := obj.(*erasureServerPools)
 	if !ok {
 		t.Fatal("Unexpected object layer detected", reflect.TypeOf(obj))
 	}
@@ -50,11 +51,11 @@ func TestNewObjectLayer(t *testing.T) {
 	nDisks = 16
 	disks, err = getRandomDisks(nDisks)
 	if err != nil {
-		t.Fatal("Failed to create disks for the backend")
+		t.Fatal("Failed to create drives for the backend")
 	}
 	defer removeRoots(disks)
 
-	obj, err = newObjectLayer(ctx, mustGetPoolEndpoints(disks...))
+	obj, err = newObjectLayer(ctx, mustGetPoolEndpoints(0, disks...))
 	if err != nil {
 		t.Fatal("Unexpected object layer initialization error", err)
 	}

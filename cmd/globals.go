@@ -393,8 +393,8 @@ var (
 	// Is _MINIO_DISABLE_API_FREEZE_ON_BOOT set?
 	globalDisableFreezeOnBoot bool
 
-	//Use to set custom owner id and display name
-	globalOwnerID          = globalMinioDefaultOwnerID
+	// Use to set custom owner id and display name
+	globalOwnerID = globalMinioDefaultOwnerID
 
 	// Add new variable global values here.
 

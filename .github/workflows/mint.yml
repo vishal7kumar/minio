@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   mint-test:
-    runs-on: mint
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: cleanup #https://github.com/actions/checkout/issues/273

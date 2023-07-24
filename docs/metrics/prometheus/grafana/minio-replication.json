@@ -438,7 +438,7 @@
         "targets": [
           {
             "exemplar": true,
-            "expr": "max by (range) (minio_bucket_objects_size_distribution{job=\"$scrape_jobs\"})",
+            "expr": "max by (range) (sum (minio_bucket_objects_size_distribution{job=\"$scrape_jobs\"}) by (range))",
             "format": "time_series",
             "instant": false,
             "interval": "",
@@ -838,7 +838,7 @@
             "instant": true,
             "interval": "",
             "intervalFactor": 1,
-            "legendFormat": "Total online disks in MinIO Cluster",
+            "legendFormat": "Total online drives in MinIO Cluster",
             "metric": "process_start_time_seconds",
             "refId": "A",
             "step": 60
@@ -846,7 +846,7 @@
         ],
         "timeFrom": null,
         "timeShift": null,
-        "title": "Total Online Disks",
+        "title": "Total Online Drives",
         "type": "stat"
       },
       {
@@ -1276,7 +1276,7 @@
         ],
         "timeFrom": null,
         "timeShift": null,
-        "title": "Total Offline Disks",
+        "title": "Total Offline Drives",
         "type": "stat"
       },
       {
@@ -2392,7 +2392,7 @@
         "targets": [
           {
             "exemplar": true,
-            "expr": "minio_cluster_disk_free_inodes{job=\"$scrape_jobs\"}",
+            "expr": "minio_node_disk_free_inodes{job=\"$scrape_jobs\"}",
             "format": "time_series",
             "instant": false,
             "interval": "",
@@ -2453,7 +2453,7 @@
         "dashLength": 10,
         "dashes": false,
         "datasource": "${DS_PROMETHEUS}",
-        "description": "Number of online disks per MinIO Server",
+        "description": "Number of online drives per MinIO Server",
         "fieldConfig": {
           "defaults": {
             "links": []
@@ -2784,9 +2784,9 @@
           "description": null,
           "error": null,
           "hide": 0,
-          "includeAll": true,
+          "includeAll": false,
           "label": null,
-          "multi": true,
+          "multi": false,
           "name": "scrape_jobs",
           "options": [],
           "query": {
@@ -2834,4 +2834,3 @@
     "uid": "TgmJnqnnk",
     "version": 18
   }
-  

@@ -23,25 +23,29 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/dsync"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/sync/errgroup"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/sync/errgroup"
 )
+
+// list all errors that can be ignore in a bucket operation.
+var bucketOpIgnoredErrs = append(baseIgnoredErrs, errDiskAccessDenied, errUnformattedDisk)
+
+// list all errors that can be ignored in a bucket metadata operation.
+var bucketMetadataOpIgnoredErrs = append(bucketOpIgnoredErrs, errVolumeNotFound)
 
 // OfflineDisk represents an unavailable disk.
 var OfflineDisk StorageAPI // zero value is nil
 
 // erasureObjects - Implements ER object layer.
 type erasureObjects struct {
-	GatewayUnsupported
-
 	setDriveCount      int
 	defaultParityCount int
 
@@ -67,8 +71,6 @@ type erasureObjects struct {
 	// Byte pools used for temporary i/o buffers,
 	// legacy objects.
 	bpOld *bpool.BytePoolCap
-
-	deletedCleanupSleeper *dynamicSleeper
 }
 
 // NewNSLock - initialize a new namespace RWLocker instance.
@@ -79,7 +81,7 @@ func (er erasureObjects) NewNSLock(bucket string, objects ...string) RWLocker {
 // Shutdown function for object storage interface.
 func (er erasureObjects) Shutdown(ctx context.Context) error {
 	// Add any object layer shutdown activities here.
-	closeStorageDisks(er.getDisks())
+	closeStorageDisks(er.getDisks()...)
 	return nil
 }
 
@@ -92,23 +94,9 @@ func (er erasureObjects) defaultWQuorum() int {
 	return dataCount
 }
 
-func (er erasureObjects) defaultRQuorum() int {
-	return er.setDriveCount - er.defaultParityCount
-}
-
-// byDiskTotal is a collection satisfying sort.Interface.
-type byDiskTotal []madmin.Disk
-
-func (d byDiskTotal) Len() int      { return len(d) }
-func (d byDiskTotal) Swap(i, j int) { d[i], d[j] = d[j], d[i] }
-func (d byDiskTotal) Less(i, j int) bool {
-	return d[i].TotalSpace < d[j].TotalSpace
-}
-
 func diskErrToDriveState(err error) (state string) {
-	state = madmin.DriveStateUnknown
 	switch {
-	case errors.Is(err, errDiskNotFound):
+	case errors.Is(err, errDiskNotFound) || errors.Is(err, context.DeadlineExceeded):
 		state = madmin.DriveStateOffline
 	case errors.Is(err, errCorruptedFormat):
 		state = madmin.DriveStateCorrupt
@@ -120,7 +108,10 @@ func diskErrToDriveState(err error) (state string) {
 		state = madmin.DriveStateFaulty
 	case err == nil:
 		state = madmin.DriveStateOk
+	default:
+		state = fmt.Sprintf("%s (cause: %s)", madmin.DriveStateUnknown, err)
 	}
+
 	return
 }
 
@@ -176,36 +167,39 @@ func getOnlineOfflineDisksStats(disksInfo []madmin.Disk) (onlineDisks, offlineDi
 }
 
 // getDisksInfo - fetch disks info across all other storage API.
-func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.Disk, errs []error) {
+func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.Disk) {
 	disksInfo = make([]madmin.Disk, len(disks))
 
 	g := errgroup.WithNErrs(len(disks))
 	for index := range disks {
 		index := index
 		g.Go(func() error {
+			di := madmin.Disk{
+				Endpoint:  endpoints[index].String(),
+				PoolIndex: endpoints[index].PoolIdx,
+				SetIndex:  endpoints[index].SetIdx,
+				DiskIndex: endpoints[index].DiskIdx,
+			}
 			if disks[index] == OfflineDisk {
-				logger.LogIf(GlobalContext, fmt.Errorf("%s: %s", errDiskNotFound, endpoints[index]))
-				disksInfo[index] = madmin.Disk{
-					State:    diskErrToDriveState(errDiskNotFound),
-					Endpoint: endpoints[index].String(),
-				}
-				// Storage disk is empty, perhaps ignored disk or not available.
-				return errDiskNotFound
+				logger.LogOnceIf(GlobalContext, fmt.Errorf("%s: %s", errDiskNotFound, endpoints[index]), "get-disks-info-offline-"+di.Endpoint)
+				di.State = diskErrToDriveState(errDiskNotFound)
+				disksInfo[index] = di
+				return nil
 			}
 			info, err := disks[index].DiskInfo(context.TODO())
-			di := madmin.Disk{
-				Endpoint:       info.Endpoint,
-				DrivePath:      info.MountPath,
-				TotalSpace:     info.Total,
-				UsedSpace:      info.Used,
-				AvailableSpace: info.Free,
-				UUID:           info.ID,
-				RootDisk:       info.RootDisk,
-				Healing:        info.Healing,
-				State:          diskErrToDriveState(err),
-				FreeInodes:     info.FreeInodes,
-			}
-			di.PoolIndex, di.SetIndex, di.DiskIndex = disks[index].GetDiskLoc()
+			di.DrivePath = info.MountPath
+			di.TotalSpace = info.Total
+			di.UsedSpace = info.Used
+			di.AvailableSpace = info.Free
+			di.UUID = info.ID
+			di.Major = info.Major
+			di.Minor = info.Minor
+			di.RootDisk = info.RootDisk
+			di.Healing = info.Healing
+			di.Scanning = info.Scanning
+			di.State = diskErrToDriveState(err)
+			di.FreeInodes = info.FreeInodes
+			di.UsedInodes = info.UsedInodes
 			if info.Healing {
 				if hi := disks[index].Healing(); hi != nil {
 					hd := hi.toHealingDisk()
@@ -213,11 +207,13 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.
 				}
 			}
 			di.Metrics = &madmin.DiskMetrics{
-				APILatencies: make(map[string]interface{}),
-				APICalls:     make(map[string]uint64),
+				LastMinute: make(map[string]madmin.TimedAction, len(info.Metrics.LastMinute)),
+				APICalls:   make(map[string]uint64, len(info.Metrics.APICalls)),
 			}
-			for k, v := range info.Metrics.APILatencies {
-				di.Metrics.APILatencies[k] = v
+			for k, v := range info.Metrics.LastMinute {
+				if v.N > 0 {
+					di.Metrics.LastMinute[k] = v.asTimedAction()
+				}
 			}
 			for k, v := range info.Metrics.APICalls {
 				di.Metrics.APICalls[k] = v
@@ -226,37 +222,40 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.
 				di.Utilization = float64(info.Used / info.Total * 100)
 			}
 			disksInfo[index] = di
-			return err
+			return nil
 		}, index)
 	}
 
-	return disksInfo, g.Wait()
+	g.Wait()
+	return disksInfo
 }
 
 // Get an aggregated storage info across all disks.
-func getStorageInfo(disks []StorageAPI, endpoints []Endpoint) (StorageInfo, []error) {
-	disksInfo, errs := getDisksInfo(disks, endpoints)
+func getStorageInfo(disks []StorageAPI, endpoints []Endpoint) StorageInfo {
+	disksInfo := getDisksInfo(disks, endpoints)
 
 	// Sort so that the first element is the smallest.
-	sort.Sort(byDiskTotal(disksInfo))
+	sort.Slice(disksInfo, func(i, j int) bool {
+		return disksInfo[i].TotalSpace < disksInfo[j].TotalSpace
+	})
 
 	storageInfo := StorageInfo{
 		Disks: disksInfo,
 	}
 
 	storageInfo.Backend.Type = madmin.Erasure
-	return storageInfo, errs
+	return storageInfo
 }
 
 // StorageInfo - returns underlying storage statistics.
-func (er erasureObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
+func (er erasureObjects) StorageInfo(ctx context.Context) StorageInfo {
 	disks := er.getDisks()
 	endpoints := er.getEndpoints()
 	return getStorageInfo(disks, endpoints)
 }
 
 // LocalStorageInfo - returns underlying local storage statistics.
-func (er erasureObjects) LocalStorageInfo(ctx context.Context) (StorageInfo, []error) {
+func (er erasureObjects) LocalStorageInfo(ctx context.Context) StorageInfo {
 	disks := er.getDisks()
 	endpoints := er.getEndpoints()
 
@@ -277,31 +276,33 @@ func (er erasureObjects) getOnlineDisksWithHealing() (newDisks []StorageAPI, hea
 	var wg sync.WaitGroup
 	disks := er.getDisks()
 	infos := make([]DiskInfo, len(disks))
-	for _, i := range hashOrder(UTCNow().String(), len(disks)) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for _, i := range r.Perm(len(disks)) {
 		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			disk := disks[i-1]
-
+			disk := disks[i]
 			if disk == nil {
-				infos[i-1].Error = "nil disk"
+				infos[i].Error = "offline drive"
 				return
 			}
 
 			di, err := disk.DiskInfo(context.Background())
-			if err != nil {
+			if err != nil || di.Healing {
 				// - Do not consume disks which are not reachable
 				//   unformatted or simply not accessible for some reason.
 				//
 				//
 				// - Future: skip busy disks
-				infos[i-1].Error = err.Error()
+				if err != nil {
+					infos[i].Error = err.Error()
+				}
 				return
 			}
 
-			infos[i-1] = di
+			infos[i] = di
 		}()
 	}
 	wg.Wait()
@@ -331,7 +332,7 @@ func (er erasureObjects) cleanupDeletedObjects(ctx context.Context) {
 				defer wg.Done()
 				diskPath := disk.Endpoint().Path
 				readDirFn(pathJoin(diskPath, minioMetaTmpDeletedBucket), func(ddir string, typ os.FileMode) error {
-					wait := er.deletedCleanupSleeper.Timer(ctx)
+					wait := deletedCleanupSleeper.Timer(ctx)
 					removeAll(pathJoin(diskPath, minioMetaTmpDeletedBucket, ddir))
 					wait()
 					return nil
@@ -344,7 +345,7 @@ func (er erasureObjects) cleanupDeletedObjects(ctx context.Context) {
 
 // nsScanner will start scanning buckets and send updated totals as they are traversed.
 // Updates are sent on a regular basis and the caller *must* consume them.
-func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf *bloomFilter, wantCycle uint32, updates chan<- dataUsageCache) error {
+func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wantCycle uint32, updates chan<- dataUsageCache, healScanMode madmin.HealScanMode) error {
 	if len(buckets) == 0 {
 		return nil
 	}
@@ -352,7 +353,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 	// Collect disks we can use.
 	disks, healing := er.getOnlineDisksWithHealing()
 	if len(disks) == 0 {
-		logger.LogIf(ctx, errors.New("data-scanner: all disks are offline or being healed, skipping scanner cycle"))
+		logger.LogIf(ctx, errors.New("data-scanner: all drives are offline or being healed, skipping scanner cycle"))
 		return nil
 	}
 
@@ -370,27 +371,33 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 		},
 		Cache: make(map[string]dataUsageEntry, len(oldCache.Cache)),
 	}
-	bloom := bf.bytes()
 
 	// Put all buckets into channel.
 	bucketCh := make(chan BucketInfo, len(buckets))
+
+	// Shuffle buckets to ensure total randomness of buckets, being scanned.
+	// Otherwise same set of buckets get scanned across erasure sets always.
+	// at any given point in time. This allows different buckets to be scanned
+	// in different order per erasure set, this wider spread is needed when
+	// there are lots of buckets with different order of objects in them.
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	permutes := r.Perm(len(buckets))
 	// Add new buckets first
-	for _, b := range buckets {
-		if oldCache.find(b.Name) == nil {
+	for _, idx := range permutes {
+		b := buckets[idx]
+		if e := oldCache.find(b.Name); e == nil {
 			bucketCh <- b
 		}
 	}
-
-	// Add existing buckets.
-	for _, b := range buckets {
-		e := oldCache.find(b.Name)
-		if e != nil {
+	for _, idx := range permutes {
+		b := buckets[idx]
+		if e := oldCache.find(b.Name); e != nil {
 			cache.replace(b.Name, dataUsageRoot, *e)
 			bucketCh <- b
 		}
 	}
-
 	close(bucketCh)
+
 	bucketResults := make(chan dataUsageEntryInfo, len(disks))
 
 	// Start async collector/saver.
@@ -407,14 +414,11 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 
 		for {
 			select {
-			case <-ctx.Done():
-				// Return without saving.
-				return
 			case <-t.C:
 				if cache.Info.LastUpdate.Equal(lastSave) {
 					continue
 				}
-				logger.LogIf(ctx, cache.save(ctx, er, dataUsageCacheName))
+				logger.LogOnceIf(ctx, cache.save(ctx, er, dataUsageCacheName), "nsscanner-cache-update")
 				updates <- cache.clone()
 				lastSave = cache.Info.LastUpdate
 			case v, ok := <-bucketResults:
@@ -422,7 +426,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 					// Save final state...
 					cache.Info.NextCycle = wantCycle
 					cache.Info.LastUpdate = time.Now()
-					logger.LogIf(ctx, cache.save(ctx, er, dataUsageCacheName))
+					logger.LogOnceIf(ctx, cache.save(ctx, er, dataUsageCacheName), "nsscanner-channel-closed")
 					updates <- cache
 					return
 				}
@@ -432,14 +436,17 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 		}
 	}()
 
-	// Shuffle disks to ensure a total randomness of bucket/disk association to ensure
-	// that objects that are not present in all disks are accounted and ILM applied.
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	r.Shuffle(len(disks), func(i, j int) { disks[i], disks[j] = disks[j], disks[i] })
+	// Restrict parallelism for disk usage scanner
+	// upto GOMAXPROCS if GOMAXPROCS is < len(disks)
+	maxProcs := runtime.GOMAXPROCS(0)
+	if maxProcs < len(disks) {
+		disks = disks[:maxProcs]
+	}
 
 	// Start one scanner per disk
 	var wg sync.WaitGroup
 	wg.Add(len(disks))
+
 	for i := range disks {
 		go func(i int) {
 			defer wg.Done()
@@ -459,7 +466,6 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 				if cache.Info.Name == "" {
 					cache.Info.Name = bucket.Name
 				}
-				cache.Info.BloomFilter = bloom
 				cache.Info.SkipHealing = healing
 				cache.Info.NextCycle = wantCycle
 				if cache.Info.Name != bucket.Name {
@@ -477,21 +483,20 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 				go func(name string) {
 					defer wg.Done()
 					for update := range updates {
-						bucketResults <- dataUsageEntryInfo{
+						select {
+						case <-ctx.Done():
+						case bucketResults <- dataUsageEntryInfo{
 							Name:   name,
 							Parent: dataUsageRoot,
 							Entry:  update,
-						}
-						if intDataUpdateTracker.debug {
-							console.Debugln("z:", er.poolIndex, "s:", er.setIndex, "bucket", name, "got update", update)
+						}:
 						}
 					}
 				}(cache.Info.Name)
 				// Calc usage
 				before := cache.Info.LastUpdate
 				var err error
-				cache, err = disk.NSScanner(ctx, cache, updates)
-				cache.Info.BloomFilter = nil
+				cache, err = disk.NSScanner(ctx, cache, updates, healScanMode)
 				if err != nil {
 					if !cache.Info.LastUpdate.IsZero() && cache.Info.LastUpdate.After(before) {
 						logger.LogIf(ctx, cache.save(ctx, er, cacheName))
@@ -511,15 +516,16 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 				if r := cache.root(); r != nil {
 					root = cache.flatten(*r)
 				}
-				t := time.Now()
-				bucketResults <- dataUsageEntryInfo{
+				select {
+				case <-ctx.Done():
+					return
+				case bucketResults <- dataUsageEntryInfo{
 					Name:   cache.Info.Name,
 					Parent: dataUsageRoot,
 					Entry:  root,
+				}:
 				}
-				// We want to avoid synchronizing up all writes in case
-				// the results are piled up.
-				time.Sleep(time.Duration(float64(time.Since(t)) * rand.Float64()))
+
 				// Save cache
 				logger.LogIf(ctx, cache.save(ctx, er, cacheName))
 			}

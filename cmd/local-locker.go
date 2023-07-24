@@ -60,15 +60,6 @@ func (l *localLocker) String() string {
 	return globalEndpoints.Localhost()
 }
 
-func (l *localLocker) canTakeUnlock(resources ...string) bool {
-	for _, resource := range resources {
-		if !isWriteLock(l.lockMap[resource]) {
-			return false
-		}
-	}
-	return true
-}
-
 func (l *localLocker) canTakeLock(resources ...string) bool {
 	for _, resource := range resources {
 		_, lockTaken := l.lockMap[resource]
@@ -129,12 +120,12 @@ func (l *localLocker) Unlock(_ context.Context, args dsync.LockArgs) (reply bool
 	err = nil
 
 	for _, resource := range args.Resources {
-		if !l.canTakeUnlock(resource) {
+		lri, ok := l.lockMap[resource]
+		if ok && !isWriteLock(lri) {
 			// Unless it is a write lock reject it.
 			err = fmt.Errorf("unlock attempted on a read locked entity: %s", resource)
 			continue
 		}
-		lri, ok := l.lockMap[resource]
 		if ok {
 			reply = l.removeEntry(resource, args, &lri) || reply
 		}
@@ -222,12 +213,41 @@ func (l *localLocker) RUnlock(_ context.Context, args dsync.LockArgs) (reply boo
 	return reply, nil
 }
 
+type lockStats struct {
+	Total  int
+	Writes int
+	Reads  int
+}
+
+func (l *localLocker) stats() lockStats {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	st := lockStats{Total: len(l.lockMap)}
+	for _, v := range l.lockMap {
+		if len(v) == 0 {
+			continue
+		}
+		entry := v[0]
+		if entry.Writer {
+			st.Writes++
+		} else {
+			st.Reads += len(v)
+		}
+	}
+	return st
+}
+
 func (l *localLocker) DupLockMap() map[string][]lockRequesterInfo {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 
 	lockCopy := make(map[string][]lockRequesterInfo, len(l.lockMap))
 	for k, v := range l.lockMap {
+		if len(v) == 0 {
+			delete(l.lockMap, k)
+			continue
+		}
 		lockCopy[k] = append(make([]lockRequesterInfo, 0, len(v)), v...)
 	}
 	return lockCopy

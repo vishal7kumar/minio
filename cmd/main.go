@@ -18,12 +18,20 @@
 package cmd
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
+	"strings"
 
 	"github.com/minio/cli"
+	"github.com/minio/minio/internal/color"
+	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/env"
 	"github.com/minio/pkg/trie"
 	"github.com/minio/pkg/words"
 )
@@ -124,13 +132,14 @@ func newApp(name string) *cli.App {
 
 	// Register all commands.
 	registerCommand(serverCmd)
-	registerCommand(gatewayCmd)
+	registerCommand(gatewayCmd) // hidden kept for guiding users.
 
 	// Set up app.
 	cli.HelpFlag = cli.BoolFlag{
 		Name:  "help, h",
 		Usage: "show help",
 	}
+	cli.VersionPrinter = printMinIOVersion
 
 	app := cli.NewApp()
 	app.Name = name
@@ -159,13 +168,51 @@ func newApp(name string) *cli.App {
 	return app
 }
 
+func startupBanner(banner io.Writer) {
+	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", CopyrightYear))
+	fmt.Fprintln(banner, color.Blue("License:")+color.Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
+	fmt.Fprintln(banner, color.Blue("Version:")+color.Bold(" %s (%s %s/%s)", ReleaseTag, runtime.Version(), runtime.GOOS, runtime.GOARCH))
+}
+
+func versionBanner(c *cli.Context) io.Reader {
+	banner := &strings.Builder{}
+	fmt.Fprintln(banner, color.Bold("%s version %s (commit-id=%s)", c.App.Name, c.App.Version, CommitID))
+	fmt.Fprintln(banner, color.Blue("Runtime:")+color.Bold(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
+	fmt.Fprintln(banner, color.Blue("License:")+color.Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
+	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", CopyrightYear))
+	return strings.NewReader(banner.String())
+}
+
+func printMinIOVersion(c *cli.Context) {
+	io.Copy(c.App.Writer, versionBanner(c))
+}
+
 // Main main for minio server.
 func Main(args []string) {
 	// Set the minio app name.
 	appName := filepath.Base(args[0])
 
+	if env.Get("_MINIO_DEBUG_NO_EXIT", "") != "" {
+		freeze := func(_ int) {
+			// Infinite blocking op
+			<-make(chan struct{})
+		}
+
+		// Override the logger os.Exit()
+		logger.ExitFunc = freeze
+
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Println("panic:", err)
+				fmt.Println("")
+				fmt.Println(string(debug.Stack()))
+			}
+			freeze(-1)
+		}()
+	}
+
 	// Run the app - exit on error.
 	if err := newApp(appName).Run(args); err != nil {
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic
 	}
 }

@@ -27,7 +27,6 @@ package cmd
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
@@ -40,6 +39,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
@@ -62,8 +62,9 @@ func getCanonicalHeaders(signedHeaders http.Header) string {
 	var headers []string
 	vals := make(http.Header)
 	for k, vv := range signedHeaders {
-		headers = append(headers, strings.ToLower(k))
-		vals[strings.ToLower(k)] = vv
+		k = strings.ToLower(k)
+		headers = append(headers, k)
+		vals[k] = vv
 	}
 	sort.Strings(headers)
 
@@ -95,13 +96,13 @@ func getSignedHeaders(signedHeaders http.Header) string {
 // getCanonicalRequest generate a canonical request of style
 //
 // canonicalRequest =
-//  <HTTPMethod>\n
-//  <CanonicalURI>\n
-//  <CanonicalQueryString>\n
-//  <CanonicalHeaders>\n
-//  <SignedHeaders>\n
-//  <HashedPayload>
 //
+//	<HTTPMethod>\n
+//	<CanonicalURI>\n
+//	<CanonicalQueryString>\n
+//	<CanonicalHeaders>\n
+//	<SignedHeaders>\n
+//	<HashedPayload>
 func getCanonicalRequest(extractedSignedHeaders http.Header, payload, queryStr, urlPath, method string) string {
 	rawQuery := strings.ReplaceAll(queryStr, "+", "%20")
 	encodedPath := s3utils.EncodePath(urlPath)
@@ -169,7 +170,8 @@ func compareSignatureV4(sig1, sig2 string) bool {
 }
 
 // doesPolicySignatureMatch - Verify query headers with post policy
-//     - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+//   - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+//
 // returns ErrNone if the signature matches.
 func doesPolicySignatureV4Match(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// Server region.
@@ -203,7 +205,8 @@ func doesPolicySignatureV4Match(formValues http.Header) (auth.Credentials, APIEr
 }
 
 // doesPresignedSignatureMatch - Verify query headers with presigned signature
-//     - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+//   - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+//
 // returns ErrNone if the signature matches.
 func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region string, stype serviceType) APIErrorCode {
 	// Copy request
@@ -329,7 +332,8 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 }
 
 // doesSignatureMatch - Verify authorization header with calculated header in accordance with
-//     - http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
+//   - http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
+//
 // returns ErrNone if signature matches.
 func doesSignatureMatch(hashedPayload string, r *http.Request, region string, stype serviceType) APIErrorCode {
 	// Copy request.

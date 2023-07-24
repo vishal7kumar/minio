@@ -18,22 +18,31 @@
 package kms
 
 import (
+	"context"
 	"encoding"
 	"encoding/json"
-	"strconv"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/pkg/env"
+	"github.com/minio/kes-go"
 )
 
 // KMS is the generic interface that abstracts over
 // different KMS implementations.
 type KMS interface {
 	// Stat returns the current KMS status.
-	Stat() (Status, error)
+	Stat(cxt context.Context) (Status, error)
+
+	// IsLocal returns true if the KMS is a local implementation
+	IsLocal() bool
+
+	// List returns an array of local KMS Names
+	List() []kes.KeyInfo
+
+	// Metrics returns a KMS metric snapshot.
+	Metrics(ctx context.Context) (kes.Metric, error)
 
 	// CreateKey creates a new key at the KMS with the given key ID.
-	CreateKey(keyID string) error
+	CreateKey(ctx context.Context, keyID string) error
 
 	// GenerateKey generates a new data encryption key using the
 	// key referenced by the key ID.
@@ -47,7 +56,7 @@ type KMS interface {
 	// should be decrypted. Therefore, it is the callers
 	// responsibility to remember the corresponding context for
 	// a particular DEK. The context may be nil.
-	GenerateKey(keyID string, context Context) (DEK, error)
+	GenerateKey(ctx context.Context, keyID string, context Context) (DEK, error)
 
 	// DecryptKey decrypts the ciphertext with the key referenced
 	// by the key ID. The context must match the context value
@@ -57,19 +66,19 @@ type KMS interface {
 	// DecryptAll decrypts all ciphertexts with the key referenced
 	// by the key ID. The contexts must match the context value
 	// used to generate the ciphertexts.
-	DecryptAll(keyID string, ciphertext [][]byte, context []Context) ([][]byte, error)
+	DecryptAll(ctx context.Context, keyID string, ciphertext [][]byte, context []Context) ([][]byte, error)
+
+	// Verify verifies all KMS endpoints and returns the details
+	Verify(cxt context.Context) []VerifyResult
 }
 
-// BatchSize returns the size of the batches that should be used during
-// KES bulk decryption API calls.
-func BatchSize() int {
-	const DefaultBatchSize = 500
-	v := env.Get("MINIO_KMS_KES_BULK_API_BATCH_SIZE", strconv.Itoa(DefaultBatchSize))
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return DefaultBatchSize
-	}
-	return n
+// VerifyResult describes the verification result details a KMS endpoint
+type VerifyResult struct {
+	Endpoint string
+	Decrypt  string
+	Encrypt  string
+	Version  string
+	Status   string
 }
 
 // Status describes the current state of a KMS.
@@ -81,6 +90,11 @@ type Status struct {
 	// is specified. It is empty if the KMS does not support
 	// a default key.
 	DefaultKey string
+
+	// Details provides more details about the KMS endpoint status.
+	// including uptime, version and available CPUs.
+	// Could be more in future.
+	Details kes.State
 }
 
 // DEK is a data encryption key. It consists of a

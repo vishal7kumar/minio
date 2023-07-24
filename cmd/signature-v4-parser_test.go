@@ -82,10 +82,11 @@ func validateCredentialfields(t *testing.T, testNum int, expectedCredentials cre
 // A valid format of creadential should be of the following format.
 // Credential = accessKey + SlashSeparator+ scope
 // where scope = string.Join([]string{  currTime.Format(yyyymmdd),
-// 			globalMinioDefaultRegion,
-//               	"s3",
-//		        "aws4_request",
-//                       },SlashSeparator)
+//
+//				globalMinioDefaultRegion,
+//	              	"s3",
+//			        "aws4_request",
+//	                      },SlashSeparator)
 func TestParseCredentialHeader(t *testing.T) {
 	sampleTimeStr := UTCNow().Format(yyyymmdd)
 
@@ -629,9 +630,8 @@ func TestDoesV4PresignParamsExist(t *testing.T) {
 // TestParsePreSignV4 - Validates the parsing logic of Presignied v4 request from its url query values.
 func TestParsePreSignV4(t *testing.T) {
 	// converts the duration in seconds into string format.
-	getDurationStr := func(expires int) string {
-		return strconv.Itoa(expires)
-	}
+	getDurationStr := strconv.Itoa
+
 	// used in expected preSignValues, preSignValues.Date is of type time.Time .
 	queryTime := UTCNow()
 

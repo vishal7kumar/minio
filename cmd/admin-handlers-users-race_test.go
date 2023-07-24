@@ -26,12 +26,13 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"sync"
+	"runtime"
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/pkg/sync/errgroup"
 )
 
 func runAllIAMConcurrencyTests(suite *TestSuiteIAM, c *check) {
@@ -41,11 +42,15 @@ func runAllIAMConcurrencyTests(suite *TestSuiteIAM, c *check) {
 }
 
 func TestIAMInternalIDPConcurrencyServerSuite(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip("windows is clunky")
+	}
+
 	baseTestCases := []TestSuiteCommon{
-		// Init and run test on FS backend with signature v4.
-		{serverType: "FS", signer: signerV4},
-		// Init and run test on FS backend, with tls enabled.
-		{serverType: "FS", signer: signerV4, secure: true},
+		// Init and run test on ErasureSD backend with signature v4.
+		{serverType: "ErasureSD", signer: signerV4},
+		// Init and run test on ErasureSD backend, with tls enabled.
+		{serverType: "ErasureSD", signer: signerV4, secure: true},
 		// Init and run test on Erasure backend.
 		{serverType: "Erasure", signer: signerV4},
 		// Init and run test on ErasureSet backend.
@@ -73,7 +78,7 @@ func TestIAMInternalIDPConcurrencyServerSuite(t *testing.T) {
 }
 
 func (s *TestSuiteIAM) TestDeleteUserRace(c *check) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	bucket := getRandomBucketName()
@@ -124,18 +129,21 @@ func (s *TestSuiteIAM) TestDeleteUserRace(c *check) {
 		secretKeys[i] = secretKey
 	}
 
-	wg := sync.WaitGroup{}
+	g := errgroup.Group{}
 	for i := 0; i < userCount; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			uClient := s.getUserClient(c, accessKeys[i], secretKeys[i], "")
-			err := s.adm.RemoveUser(ctx, accessKeys[i])
-			if err != nil {
-				c.Fatalf("unable to remove user: %v", err)
+		g.Go(func(i int) func() error {
+			return func() error {
+				uClient := s.getUserClient(c, accessKeys[i], secretKeys[i], "")
+				err := s.adm.RemoveUser(ctx, accessKeys[i])
+				if err != nil {
+					return err
+				}
+				c.mustNotListObjects(ctx, uClient, bucket)
+				return nil
 			}
-			c.mustNotListObjects(ctx, uClient, bucket)
-		}(i)
+		}(i), i)
 	}
-	wg.Wait()
+	if errs := g.Wait(); len(errs) > 0 {
+		c.Fatalf("unable to remove users: %v", errs)
+	}
 }

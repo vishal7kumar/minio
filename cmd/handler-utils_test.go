@@ -21,12 +21,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/textproto"
 	"os"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/minio/minio/internal/config"
@@ -34,7 +33,10 @@ import (
 
 // Tests validate bucket LocationConstraint.
 func TestIsValidLocationContraint(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,13 +47,13 @@ func TestIsValidLocationContraint(t *testing.T) {
 
 	// Corrupted XML
 	malformedReq := &http.Request{
-		Body:          ioutil.NopCloser(bytes.NewReader([]byte("<>"))),
+		Body:          io.NopCloser(bytes.NewReader([]byte("<>"))),
 		ContentLength: int64(len("<>")),
 	}
 
 	// Not an XML
 	badRequest := &http.Request{
-		Body:          ioutil.NopCloser(bytes.NewReader([]byte("garbage"))),
+		Body:          io.NopCloser(bytes.NewReader([]byte("garbage"))),
 		ContentLength: int64(len("garbage")),
 	}
 
@@ -61,7 +63,7 @@ func TestIsValidLocationContraint(t *testing.T) {
 		createBucketConfig.Location = location
 		createBucketConfigBytes, _ := xml.Marshal(createBucketConfig)
 		createBucketConfigBuffer := bytes.NewReader(createBucketConfigBytes)
-		req.Body = ioutil.NopCloser(createBucketConfigBuffer)
+		req.Body = io.NopCloser(createBucketConfigBuffer)
 		req.ContentLength = int64(createBucketConfigBuffer.Len())
 		return req
 	}
@@ -89,44 +91,6 @@ func TestIsValidLocationContraint(t *testing.T) {
 		_, actualCode := parseLocationConstraint(testCase.request)
 		if testCase.expectedCode != actualCode {
 			t.Errorf("Test %d: Expected the APIErrCode to be %d, but instead found %d", i+1, testCase.expectedCode, actualCode)
-		}
-	}
-}
-
-// Test validate form field size.
-func TestValidateFormFieldSize(t *testing.T) {
-	testCases := []struct {
-		header http.Header
-		err    error
-	}{
-		// Empty header returns error as nil,
-		{
-			header: nil,
-			err:    nil,
-		},
-		// Valid header returns error as nil.
-		{
-			header: http.Header{
-				"Content-Type": []string{"image/png"},
-			},
-			err: nil,
-		},
-		// Invalid header value > maxFormFieldSize+1
-		{
-			header: http.Header{
-				"Garbage": []string{strings.Repeat("a", int(maxFormFieldSize)+1)},
-			},
-			err: errSizeUnexpected,
-		},
-	}
-
-	// Run validate form field size check under all test cases.
-	for i, testCase := range testCases {
-		err := validateFormFieldSize(context.Background(), testCase.header)
-		if err != nil {
-			if err.Error() != testCase.err.Error() {
-				t.Errorf("Test %d: Expected error %s, got %s", i+1, testCase.err, err)
-			}
 		}
 	}
 }
@@ -221,6 +185,9 @@ func TestGetResource(t *testing.T) {
 		expectedResource string
 	}{
 		{"/a/b/c", "test.mydomain.com", []string{"mydomain.com"}, "/test/a/b/c"},
+		{"/a/b/c", "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:17000", []string{"mydomain.com"}, "/a/b/c"},
+		{"/a/b/c", "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]", []string{"mydomain.com"}, "/a/b/c"},
+		{"/a/b/c", "192.168.1.1:9000", []string{"mydomain.com"}, "/a/b/c"},
 		{"/a/b/c", "test.mydomain.com", []string{"notmydomain.com"}, "/a/b/c"},
 		{"/a/b/c", "test.mydomain.com", nil, "/a/b/c"},
 	}

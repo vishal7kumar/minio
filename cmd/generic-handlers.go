@@ -18,23 +18,26 @@
 package cmd
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"path"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
 	xnet "github.com/minio/pkg/net"
 
-	"github.com/dustin/go-humanize"
+	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/config/dns"
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/http/stats"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/mcontext"
 )
 
 const (
@@ -51,6 +54,9 @@ const (
 
 	// Maximum size for user-defined metadata - See: https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html
 	maxUserDataSize = 2 * 1024
+
+	// maxBuckets upto 500000 for any MinIO deployment.
+	maxBuckets = 500 * 1000
 )
 
 // ReservedMetadataPrefix is the prefix of a metadata key which
@@ -65,7 +71,7 @@ const (
 // and must not set by clients
 func containsReservedMetadata(header http.Header) bool {
 	for key := range header {
-		if strings.HasPrefix(strings.ToLower(key), ReservedMetadataPrefixLower) {
+		if stringsHasPrefixFold(key, ReservedMetadataPrefix) {
 			return true
 		}
 	}
@@ -81,7 +87,7 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 		length := len(key) + len(header.Get(key))
 		size += length
 		for _, prefix := range userMetadataKeyPrefixes {
-			if strings.HasPrefix(strings.ToLower(key), prefix) {
+			if stringsHasPrefixFold(key, prefix) {
 				usersize += length
 				break
 			}
@@ -94,14 +100,29 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 }
 
 // Limits body and header to specific allowed maximum limits as per S3/MinIO API requirements.
-func setRequestLimitHandler(h http.Handler) http.Handler {
+func setRequestLimitMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+
 		// Reject unsupported reserved metadata first before validation.
 		if containsReservedMetadata(r.Header) {
+			if ok {
+				tc.FuncName = "handler.ValidRequest"
+				tc.ResponseRecorder.LogErrBody = true
+			}
+
+			defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
 			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrUnsupportedMetadata), r.URL)
 			return
 		}
+
 		if isHTTPHeaderSizeTooLarge(r.Header) {
+			if ok {
+				tc.FuncName = "handler.ValidRequest"
+				tc.ResponseRecorder.LogErrBody = true
+			}
+
+			defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
 			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrMetadataTooLarge), r.URL)
 			atomic.AddUint64(&globalHTTPStats.rejectedRequestsHeader, 1)
 			return
@@ -116,7 +137,8 @@ func setRequestLimitHandler(h http.Handler) http.Handler {
 const (
 	minioReservedBucket     = "minio"
 	minioReservedBucketPath = SlashSeparator + minioReservedBucket
-	loginPathPrefix         = SlashSeparator + "login"
+
+	loginPathPrefix = SlashSeparator + "login"
 )
 
 func guessIsBrowserReq(r *http.Request) bool {
@@ -125,7 +147,7 @@ func guessIsBrowserReq(r *http.Request) bool {
 		globalBrowserEnabled && aType == authTypeAnonymous
 }
 
-func setBrowserRedirectHandler(h http.Handler) http.Handler {
+func setBrowserRedirectMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		read := r.Method == http.MethodGet || r.Method == http.MethodHead
 		// Re-direction is handled specifically for browser requests.
@@ -141,6 +163,14 @@ func setBrowserRedirectHandler(h http.Handler) http.Handler {
 	})
 }
 
+var redirectPrefixes = map[string]struct{}{
+	"favicon-16x16.png": {},
+	"favicon-32x32.png": {},
+	"favicon-96x96.png": {},
+	"index.html":        {},
+	minioReservedBucket: {},
+}
+
 // Fetch redirect location if urlPath satisfies certain
 // criteria. Some special names are considered to be
 // redirectable, this is purely internal function and
@@ -151,32 +181,25 @@ func getRedirectLocation(r *http.Request) *xnet.URL {
 	if err != nil {
 		return nil
 	}
-	for _, prefix := range []string{
-		"favicon-16x16.png",
-		"favicon-32x32.png",
-		"favicon-96x96.png",
-		"index.html",
-		minioReservedBucket,
-	} {
-		bucket, _ := path2BucketObject(resource)
-		if path.Clean(bucket) == prefix || resource == slashSeparator {
-			if globalBrowserRedirectURL != nil {
-				return globalBrowserRedirectURL
-			}
-			hostname, _, _ := net.SplitHostPort(r.Host)
-			if hostname == "" {
-				hostname = r.Host
-			}
-			return &xnet.URL{
-				Host: net.JoinHostPort(hostname, globalMinioConsolePort),
-				Scheme: func() string {
-					scheme := "http"
-					if r.TLS != nil {
-						scheme = "https"
-					}
-					return scheme
-				}(),
-			}
+	bucket, _ := path2BucketObject(resource)
+	_, redirect := redirectPrefixes[path.Clean(bucket)]
+	if redirect || resource == slashSeparator {
+		if globalBrowserRedirectURL != nil {
+			return globalBrowserRedirectURL
+		}
+		xhost, err := xnet.ParseHost(r.Host)
+		if err != nil {
+			return nil
+		}
+		return &xnet.URL{
+			Host: net.JoinHostPort(xhost.Name, globalMinioConsolePort),
+			Scheme: func() string {
+				scheme := "http"
+				if r.TLS != nil {
+					scheme = "https"
+				}
+				return scheme
+			}(),
 		}
 	}
 	return nil
@@ -206,7 +229,8 @@ func guessIsMetricsReq(req *http.Request) bool {
 	return (aType == authTypeAnonymous || aType == authTypeJWT) &&
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsPathLegacy ||
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ClusterPath ||
-		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath ||
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2BucketPath
 }
 
 // guessIsRPCReq - returns true if the request is for an RPC endpoint.
@@ -224,15 +248,10 @@ func isAdminReq(r *http.Request) bool {
 	return strings.HasPrefix(r.URL.Path, adminPathPrefix)
 }
 
-// Supported amz date formats.
-var amzDateFormats = []string{
-	// Do not change this order, x-amz-date format is usually in
-	// iso8601Format rest are meant for relaxed handling of other
-	// odd SDKs that might be out there.
-	iso8601Format,
-	time.RFC1123,
-	time.RFC1123Z,
-	// Add new AMZ date formats here.
+// Check to allow access to the reserved "bucket" `/minio` for KMS
+// API requests.
+func isKMSReq(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Path, kmsPathPrefix)
 }
 
 // Supported Amz date headers.
@@ -243,49 +262,21 @@ var amzDateHeaders = []string{
 	"date",
 }
 
-// parseAmzDate - parses date string into supported amz date formats.
-func parseAmzDate(amzDateStr string) (amzDate time.Time, apiErr APIErrorCode) {
-	for _, dateFormat := range amzDateFormats {
-		amzDate, err := time.Parse(dateFormat, amzDateStr)
-		if err == nil {
-			return amzDate, ErrNone
-		}
-	}
-	return time.Time{}, ErrMalformedDate
-}
-
 // parseAmzDateHeader - parses supported amz date headers, in
 // supported amz date formats.
 func parseAmzDateHeader(req *http.Request) (time.Time, APIErrorCode) {
 	for _, amzDateHeader := range amzDateHeaders {
 		amzDateStr := req.Header.Get(amzDateHeader)
 		if amzDateStr != "" {
-			return parseAmzDate(amzDateStr)
+			t, err := amztime.Parse(amzDateStr)
+			if err != nil {
+				return time.Time{}, ErrMalformedDate
+			}
+			return t, ErrNone
 		}
 	}
 	// Date header missing.
 	return time.Time{}, ErrMissingDateHeader
-}
-
-// setHttpStatsHandler sets a http Stats handler to gather HTTP statistics
-func setHTTPStatsHandler(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Meters s3 connection stats.
-		meteredRequest := &stats.IncomingTrafficMeter{ReadCloser: r.Body}
-		meteredResponse := &stats.OutgoingTrafficMeter{ResponseWriter: w}
-
-		// Execute the request
-		r.Body = meteredRequest
-		h.ServeHTTP(meteredResponse, r)
-
-		if strings.HasPrefix(r.URL.Path, minioReservedBucketPath) {
-			globalConnStats.incInputBytes(meteredRequest.BytesRead())
-			globalConnStats.incOutputBytes(meteredResponse.BytesWritten())
-		} else {
-			globalConnStats.incS3InputBytes(meteredRequest.BytesRead())
-			globalConnStats.incS3OutputBytes(meteredResponse.BytesWritten())
-		}
-	})
 }
 
 // Bad path components to be rejected by the path validity handler.
@@ -294,10 +285,19 @@ const (
 	dotComponent    = "."
 )
 
+func hasBadHost(host string) error {
+	if globalIsCICD && strings.TrimSpace(host) == "" {
+		// under CI/CD test setups ignore empty hosts as invalid hosts
+		return nil
+	}
+	_, err := xnet.ParseHost(host)
+	return err
+}
+
 // Check if the incoming path has bad path components,
 // such as ".." and "."
 func hasBadPathComponent(path string) bool {
-	path = strings.TrimSpace(path)
+	path = filepath.ToSlash(strings.TrimSpace(path)) // For windows '\' must be converted to '/'
 	for _, p := range strings.Split(path, SlashSeparator) {
 		switch strings.TrimSpace(p) {
 		case dotdotComponent:
@@ -312,7 +312,11 @@ func hasBadPathComponent(path string) bool {
 // Check if client is sending a malicious request.
 func hasMultipleAuth(r *http.Request) bool {
 	authTypeCount := 0
-	for _, hasValidAuth := range []func(*http.Request) bool{isRequestSignatureV2, isRequestPresignedSignatureV2, isRequestSignatureV4, isRequestPresignedSignatureV4, isRequestJWT, isRequestPostPolicySignatureV4} {
+	for _, hasValidAuth := range []func(*http.Request) bool{
+		isRequestSignatureV2, isRequestPresignedSignatureV2,
+		isRequestSignatureV4, isRequestPresignedSignatureV4,
+		isRequestJWT, isRequestPostPolicySignatureV4,
+	} {
 		if hasValidAuth(r) {
 			authTypeCount++
 		}
@@ -322,18 +326,49 @@ func hasMultipleAuth(r *http.Request) bool {
 
 // requestValidityHandler validates all the incoming paths for
 // any malicious requests.
-func setRequestValidityHandler(h http.Handler) http.Handler {
+func setRequestValidityMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+
+		if err := hasBadHost(r.Host); err != nil {
+			if ok {
+				tc.FuncName = "handler.ValidRequest"
+				tc.ResponseRecorder.LogErrBody = true
+			}
+
+			defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
+			invalidReq := errorCodes.ToAPIErr(ErrInvalidRequest)
+			invalidReq.Description = fmt.Sprintf("%s (%s)", invalidReq.Description, err)
+			writeErrorResponse(r.Context(), w, invalidReq, r.URL)
+			atomic.AddUint64(&globalHTTPStats.rejectedRequestsInvalid, 1)
+			return
+		}
+
 		// Check for bad components in URL path.
 		if hasBadPathComponent(r.URL.Path) {
+			if ok {
+				tc.FuncName = "handler.ValidRequest"
+				tc.ResponseRecorder.LogErrBody = true
+			}
+
+			defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
 			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL)
 			atomic.AddUint64(&globalHTTPStats.rejectedRequestsInvalid, 1)
 			return
 		}
 		// Check for bad components in URL query values.
-		for _, vv := range r.Form {
+		for k, vv := range r.Form {
+			if k == "delimiter" { // delimiters are allowed to have `.` or `..`
+				continue
+			}
 			for _, v := range vv {
 				if hasBadPathComponent(v) {
+					if ok {
+						tc.FuncName = "handler.ValidRequest"
+						tc.ResponseRecorder.LogErrBody = true
+					}
+
+					defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
 					writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL)
 					atomic.AddUint64(&globalHTTPStats.rejectedRequestsInvalid, 1)
 					return
@@ -341,14 +376,27 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 			}
 		}
 		if hasMultipleAuth(r) {
-			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
+			if ok {
+				tc.FuncName = "handler.Auth"
+				tc.ResponseRecorder.LogErrBody = true
+			}
+
+			defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
+			invalidReq := errorCodes.ToAPIErr(ErrInvalidRequest)
+			invalidReq.Description = fmt.Sprintf("%s (request has multiple authentication types, please use one)", invalidReq.Description)
+			writeErrorResponse(r.Context(), w, invalidReq, r.URL)
 			atomic.AddUint64(&globalHTTPStats.rejectedRequestsInvalid, 1)
 			return
 		}
 		// For all other requests reject access to reserved buckets
 		bucketName, _ := request2BucketObjectName(r)
 		if isMinioReservedBucket(bucketName) || isMinioMetaBucket(bucketName) {
-			if !guessIsRPCReq(r) && !guessIsBrowserReq(r) && !guessIsHealthCheckReq(r) && !guessIsMetricsReq(r) && !isAdminReq(r) {
+			if !guessIsRPCReq(r) && !guessIsBrowserReq(r) && !guessIsHealthCheckReq(r) && !guessIsMetricsReq(r) && !isAdminReq(r) && !isKMSReq(r) {
+				if ok {
+					tc.FuncName = "handler.ValidRequest"
+					tc.ResponseRecorder.LogErrBody = true
+				}
+				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
 				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrAllAccessDisabled), r.URL)
 				return
 			}
@@ -356,8 +404,20 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 		// Deny SSE-C requests if not made over TLS
 		if !globalIsTLS && (crypto.SSEC.IsRequested(r.Header) || crypto.SSECopy.IsRequested(r.Header)) {
 			if r.Method == http.MethodHead {
+				if ok {
+					tc.FuncName = "handler.ValidRequest"
+					tc.ResponseRecorder.LogErrBody = false
+				}
+
+				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
 				writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrInsecureSSECustomerRequest))
 			} else {
+				if ok {
+					tc.FuncName = "handler.ValidRequest"
+					tc.ResponseRecorder.LogErrBody = true
+				}
+
+				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
 				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInsecureSSECustomerRequest), r.URL)
 			}
 			return
@@ -366,10 +426,10 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 	})
 }
 
-// setBucketForwardingHandler middleware forwards the path style requests
+// setBucketForwardingMiddleware middleware forwards the path style requests
 // on a bucket to the right bucket location, bucket to IP configuration
 // is obtained from centralized etcd configuration service.
-func setBucketForwardingHandler(h http.Handler) http.Handler {
+func setBucketForwardingMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if globalDNSConfig == nil || !globalBucketFederation ||
 			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
@@ -408,6 +468,7 @@ func setBucketForwardingHandler(h http.Handler) http.Handler {
 		}
 		sr, err := globalDNSConfig.Get(bucket)
 		if err != nil {
+			defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
 			if err == dns.ErrNoEntriesFound {
 				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrNoSuchBucket), r.URL)
 			} else {
@@ -433,13 +494,12 @@ func setBucketForwardingHandler(h http.Handler) http.Handler {
 	})
 }
 
-// addCustomHeaders adds various HTTP(S) response headers.
+// addCustomHeadersMiddleware adds various HTTP(S) response headers.
 // Security Headers enable various security protections behaviors in the client's browser.
-func addCustomHeaders(h http.Handler) http.Handler {
+func addCustomHeadersMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := w.Header()
 		header.Set("X-XSS-Protection", "1; mode=block")                                // Prevents against XSS attacks
-		header.Set("Content-Security-Policy", "block-all-mixed-content")               // prevent mixed (HTTP / HTTPS content)
 		header.Set("X-Content-Type-Options", "nosniff")                                // Prevent mime-sniff
 		header.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains") // HSTS mitigates variants of MITM attacks
 
@@ -449,7 +509,10 @@ func addCustomHeaders(h http.Handler) http.Handler {
 		// part of the log entry, Error response XML and auditing.
 		// Set custom headers such as x-amz-request-id for each request.
 		w.Header().Set(xhttp.AmzRequestID, mustGetRequestID(UTCNow()))
-		h.ServeHTTP(logger.NewResponseWriter(w), r)
+		if globalLocalNodeName != "" {
+			w.Header().Set(xhttp.AmzRequestHostID, globalLocalNodeNameHex)
+		}
+		h.ServeHTTP(w, r)
 	})
 }
 
@@ -473,6 +536,54 @@ func setCriticalErrorHandler(h http.Handler) http.Handler {
 				return
 			}
 		}()
+		h.ServeHTTP(w, r)
+	})
+}
+
+// setUploadForwardingMiddleware middleware forwards multiparts requests
+// in a site replication setup to peer that initiated the upload
+func setUploadForwardingMiddleware(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !globalSiteReplicationSys.isEnabled() ||
+			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
+			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) {
+			h.ServeHTTP(w, r)
+			return
+		}
+
+		bucket, object := request2BucketObjectName(r)
+		uploadID := r.Form.Get(xhttp.UploadID)
+
+		if bucket != "" && object != "" && uploadID != "" {
+			deplID, err := getDeplIDFromUpload(uploadID)
+			if err != nil {
+				h.ServeHTTP(w, r)
+				return
+			}
+			remote, self := globalSiteReplicationSys.getPeerForUpload(deplID)
+			if self {
+				h.ServeHTTP(w, r)
+				return
+			}
+			// forward request to peer handling this upload
+			if globalBucketTargetSys.isOffline(remote.EndpointURL) {
+				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrReplicationRemoteConnectionError), r.URL)
+				return
+			}
+
+			r.URL.Scheme = remote.EndpointURL.Scheme
+			r.URL.Host = remote.EndpointURL.Host
+			// Make sure we remove any existing headers before
+			// proxying the request to another node.
+			for k := range w.Header() {
+				w.Header().Del(k)
+			}
+			ctx := newContext(r, w, "SiteReplicationUploadForwarding")
+			defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+			globalForwarder.ServeHTTP(w, r)
+			return
+		}
 		h.ServeHTTP(w, r)
 	})
 }

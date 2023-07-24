@@ -19,29 +19,24 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	xhttp "github.com/minio/minio/internal/http"
 )
 
 const unavailable = "offline"
 
-func shouldProxy() bool {
+func isServerNotInitialized() bool {
 	return newObjectLayerFn() == nil
 }
 
 // ClusterCheckHandler returns if the server is ready for requests.
 func ClusterCheckHandler(w http.ResponseWriter, r *http.Request) {
-	if globalIsGateway {
-		writeResponse(w, http.StatusOK, nil, mimeNone)
-		return
-	}
-
 	ctx := newContext(r, w, "ClusterCheckHandler")
 
-	if shouldProxy() {
+	if isServerNotInitialized() {
 		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
 		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
 		return
@@ -52,11 +47,16 @@ func ClusterCheckHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(ctx, globalAPIConfig.getClusterDeadline())
 	defer cancel()
 
-	opts := HealthOptions{Maintenance: r.Form.Get("maintenance") == "true"}
+	opts := HealthOptions{
+		Maintenance:    r.Form.Get("maintenance") == "true",
+		DeploymentType: r.Form.Get("deployment-type"),
+	}
 	result := objLayer.Health(ctx, opts)
 	if result.WriteQuorum > 0 {
 		w.Header().Set(xhttp.MinIOWriteQuorum, strconv.Itoa(result.WriteQuorum))
 	}
+	w.Header().Set(xhttp.MinIOStorageClassDefaults, strconv.FormatBool(result.UsingDefaults))
+
 	if !result.Healthy {
 		// return how many drives are being healed if any
 		if result.HealingDrives > 0 {
@@ -77,14 +77,9 @@ func ClusterCheckHandler(w http.ResponseWriter, r *http.Request) {
 
 // ClusterReadCheckHandler returns if the server is ready for requests.
 func ClusterReadCheckHandler(w http.ResponseWriter, r *http.Request) {
-	if globalIsGateway {
-		writeResponse(w, http.StatusOK, nil, mimeNone)
-		return
-	}
-
 	ctx := newContext(r, w, "ClusterReadCheckHandler")
 
-	if shouldProxy() {
+	if isServerNotInitialized() {
 		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
 		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
 		return
@@ -111,53 +106,60 @@ func ReadinessCheckHandler(w http.ResponseWriter, r *http.Request) {
 
 // LivenessCheckHandler - Checks if the process is up. Always returns success.
 func LivenessCheckHandler(w http.ResponseWriter, r *http.Request) {
-	if shouldProxy() {
+	peerCall := r.Header.Get("x-minio-from-peer") != ""
+
+	if peerCall {
+		return
+	}
+
+	if isServerNotInitialized() {
 		// Service not initialized yet
 		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
 	}
 
-	if globalIsGateway {
-		objLayer := newObjectLayerFn()
-		if objLayer == nil {
-			apiErr := toAPIError(r.Context(), errServerNotInitialized)
+	if int(globalHTTPStats.loadRequestsInQueue()) > globalAPIConfig.getRequestsPoolCapacity() {
+		apiErr := getAPIError(ErrBusy)
+		switch r.Method {
+		case http.MethodHead:
+			writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
+		case http.MethodGet:
+			writeErrorResponse(r.Context(), w, apiErr, r.URL)
+		}
+		return
+	}
+
+	// Verify if KMS is reachable if its configured
+	if GlobalKMS != nil && !peerCall {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+
+		if _, err := GlobalKMS.Stat(ctx); err != nil {
 			switch r.Method {
 			case http.MethodHead:
+				apiErr := toAPIError(r.Context(), err)
 				writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
 			case http.MethodGet:
-				writeErrorResponse(r.Context(), w, apiErr, r.URL)
+				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
 			}
 			return
 		}
+	}
 
-		storageInfo, _ := objLayer.StorageInfo(r.Context())
-		if !storageInfo.Backend.GatewayOnline {
-			err := errors.New("gateway backend is not reachable")
-			apiErr := toAPIError(r.Context(), err)
+	if globalEtcdClient != nil {
+		// Borrowed from
+		// https://github.com/etcd-io/etcd/blob/main/etcdctl/ctlv3/command/ep_command.go#L118
+		ctx, cancel := context.WithTimeout(r.Context(), defaultContextTimeout)
+		defer cancel()
+		if _, err := globalEtcdClient.Get(ctx, "health"); err != nil {
+			// etcd unreachable throw an error..
 			switch r.Method {
 			case http.MethodHead:
+				apiErr := toAPIError(r.Context(), err)
 				writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
 			case http.MethodGet:
-				writeErrorResponse(r.Context(), w, apiErr, r.URL)
+				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
 			}
 			return
-		}
-
-		if globalEtcdClient != nil {
-			// Borrowed from
-			// https://github.com/etcd-io/etcd/blob/main/etcdctl/ctlv3/command/ep_command.go#L118
-			ctx, cancel := context.WithTimeout(r.Context(), defaultContextTimeout)
-			defer cancel()
-			if _, err := globalEtcdClient.Get(ctx, "health"); err != nil {
-				// etcd unreachable throw an error..
-				switch r.Method {
-				case http.MethodHead:
-					apiErr := toAPIError(r.Context(), err)
-					writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
-				case http.MethodGet:
-					writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
-				}
-				return
-			}
 		}
 	}
 

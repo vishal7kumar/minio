@@ -20,15 +20,20 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 
-	"github.com/minio/kes"
-	"github.com/minio/madmin-go"
+	"github.com/minio/kes-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config"
 	iampolicy "github.com/minio/pkg/iam/policy"
 )
 
+// validateAdminReq will validate request against and return whether it is allowed.
+// If any of the supplied actions are allowed it will be successful.
+// If nil ObjectLayer is returned, the operation is not permitted.
+// When nil ObjectLayer has been returned an error has always been sent to w.
 func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Request, actions ...iampolicy.AdminAction) (ObjectLayer, auth.Credentials) {
 	// Get current object layer instance.
 	objectAPI := newObjectLayerFn()
@@ -40,11 +45,16 @@ func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Reques
 	for _, action := range actions {
 		// Validate request signature.
 		cred, adminAPIErr := checkAdminRequestAuth(ctx, r, action, "")
-		if adminAPIErr != ErrNone {
+		switch adminAPIErr {
+		case ErrNone:
+			return objectAPI, cred
+		case ErrAccessDenied:
+			// Try another
+			continue
+		default:
 			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
 			return nil, cred
 		}
-		return objectAPI, cred
 	}
 	writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
 	return nil, auth.Credentials{}
@@ -74,7 +84,13 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 			Description:    e.Error(),
 			HTTPStatusCode: http.StatusBadRequest,
 		}
-	case config.Error:
+	case config.ErrConfigNotFound:
+		apiErr = APIError{
+			Code:           "XMinioConfigNotFoundError",
+			Description:    e.Error(),
+			HTTPStatusCode: http.StatusNotFound,
+		}
+	case config.ErrConfigGeneric:
 		apiErr = APIError{
 			Code:           "XMinioConfigError",
 			Description:    e.Error(),
@@ -96,6 +112,12 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 		}
 	default:
 		switch {
+		case errors.Is(err, errTooManyPolicies):
+			apiErr = APIError{
+				Code:           "XMinioAdminInvalidRequest",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
 		case errors.Is(err, errDecommissionAlreadyRunning):
 			apiErr = APIError{
 				Code:           "XMinioDecommissionNotAllowed",
@@ -105,6 +127,18 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 		case errors.Is(err, errDecommissionComplete):
 			apiErr = APIError{
 				Code:           "XMinioDecommissionNotAllowed",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errDecommissionRebalanceAlreadyRunning):
+			apiErr = APIError{
+				Code:           "XMinioDecommissionNotAllowed",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errRebalanceDecommissionAlreadyRunning):
+			apiErr = APIError{
+				Code:           "XMinioRebalanceNotAllowed",
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
@@ -120,15 +154,9 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusForbidden,
 			}
-		case errors.Is(err, errIAMServiceAccount):
+		case errors.Is(err, errIAMServiceAccountNotAllowed):
 			apiErr = APIError{
-				Code:           "XMinioIAMServiceAccount",
-				Description:    err.Error(),
-				HTTPStatusCode: http.StatusBadRequest,
-			}
-		case errors.Is(err, errIAMServiceAccountUsed):
-			apiErr = APIError{
-				Code:           "XMinioIAMServiceAccountUsed",
+				Code:           "XMinioIAMServiceAccountNotAllowed",
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
@@ -140,8 +168,14 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 			}
 		case errors.Is(err, errPolicyInUse):
 			apiErr = APIError{
-				Code:           "XMinioAdminPolicyInUse",
+				Code:           "XMinioIAMPolicyInUse",
 				Description:    "The policy cannot be removed, as it is in use",
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errSessionPolicyTooLarge):
+			apiErr = APIError{
+				Code:           "XMinioIAMServiceAccountSessionPolicyTooLarge",
+				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
 		case errors.Is(err, kes.ErrKeyExists):
@@ -176,24 +210,6 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
-		case errors.Is(err, errTierBackendInUse):
-			apiErr = APIError{
-				Code:           "XMinioAdminTierBackendInUse",
-				Description:    err.Error(),
-				HTTPStatusCode: http.StatusConflict,
-			}
-		case errors.Is(err, errTierBackendNotEmpty):
-			apiErr = APIError{
-				Code:           "XMinioAdminTierBackendNotEmpty",
-				Description:    err.Error(),
-				HTTPStatusCode: http.StatusBadRequest,
-			}
-		case errors.Is(err, errTierInsufficientCreds):
-			apiErr = APIError{
-				Code:           "XMinioAdminTierInsufficientCreds",
-				Description:    err.Error(),
-				HTTPStatusCode: http.StatusBadRequest,
-			}
 		case errIsTierPermError(err):
 			apiErr = APIError{
 				Code:           "XMinioAdminTierInsufficientPermissions",
@@ -210,10 +226,32 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 // toAdminAPIErrCode - converts errErasureWriteQuorum error to admin API
 // specific error.
 func toAdminAPIErrCode(ctx context.Context, err error) APIErrorCode {
-	switch err {
-	case errErasureWriteQuorum:
+	if errors.Is(err, errErasureWriteQuorum) {
 		return ErrAdminConfigNoQuorum
-	default:
-		return toAPIErrorCode(ctx, err)
 	}
+	return toAPIErrorCode(ctx, err)
+}
+
+// wraps export error for more context
+func exportError(ctx context.Context, err error, fname, entity string) APIError {
+	if entity == "" {
+		return toAPIError(ctx, fmt.Errorf("error exporting %s with: %w", fname, err))
+	}
+	return toAPIError(ctx, fmt.Errorf("error exporting %s from %s with: %w", entity, fname, err))
+}
+
+// wraps import error for more context
+func importError(ctx context.Context, err error, fname, entity string) APIError {
+	if entity == "" {
+		return toAPIError(ctx, fmt.Errorf("error importing %s with: %w", fname, err))
+	}
+	return toAPIError(ctx, fmt.Errorf("error importing %s from %s with: %w", entity, fname, err))
+}
+
+// wraps import error for more context
+func importErrorWithAPIErr(ctx context.Context, apiErr APIErrorCode, err error, fname, entity string) APIError {
+	if entity == "" {
+		return errorCodes.ToAPIErrWithErr(apiErr, fmt.Errorf("error importing %s with: %w", fname, err))
+	}
+	return errorCodes.ToAPIErrWithErr(apiErr, fmt.Errorf("error importing %s from %s with: %w", entity, fname, err))
 }

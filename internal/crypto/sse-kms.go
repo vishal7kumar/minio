@@ -55,7 +55,8 @@ func (ssekms) IsRequested(h http.Header) bool {
 		return true
 	}
 	if _, ok := h[xhttp.AmzServerSideEncryption]; ok {
-		return strings.ToUpper(h.Get(xhttp.AmzServerSideEncryption)) != xhttp.AmzEncryptionAES // Return only true if the SSE header is specified and does not contain the SSE-S3 value
+		// Return only true if the SSE header is specified and does not contain the SSE-S3 value
+		return strings.ToUpper(h.Get(xhttp.AmzServerSideEncryption)) != xhttp.AmzEncryptionAES
 	}
 	return false
 }
@@ -63,6 +64,10 @@ func (ssekms) IsRequested(h http.Header) bool {
 // ParseHTTP parses the SSE-KMS headers and returns the SSE-KMS key ID
 // and the KMS context on success.
 func (ssekms) ParseHTTP(h http.Header) (string, kms.Context, error) {
+	if h == nil {
+		return "", nil, ErrInvalidEncryptionMethod
+	}
+
 	algorithm := h.Get(xhttp.AmzServerSideEncryption)
 	if algorithm != xhttp.AmzEncryptionKMS {
 		return "", nil, ErrInvalidEncryptionMethod
@@ -80,7 +85,13 @@ func (ssekms) ParseHTTP(h http.Header) (string, kms.Context, error) {
 			return "", nil, err
 		}
 	}
-	return h.Get(xhttp.AmzServerSideEncryptionKmsID), ctx, nil
+
+	keyID := h.Get(xhttp.AmzServerSideEncryptionKmsID)
+	spaces := strings.HasPrefix(keyID, " ") || strings.HasSuffix(keyID, " ")
+	if spaces {
+		return "", nil, ErrInvalidEncryptionKeyID
+	}
+	return strings.TrimPrefix(keyID, ARNPrefix), ctx, nil
 }
 
 // IsEncrypted returns true if the object metadata indicates
@@ -95,8 +106,8 @@ func (ssekms) IsEncrypted(metadata map[string]string) bool {
 // UnsealObjectKey extracts and decrypts the sealed object key
 // from the metadata using KMS and returns the decrypted object
 // key.
-func (s3 ssekms) UnsealObjectKey(KMS kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
-	if KMS == nil {
+func (s3 ssekms) UnsealObjectKey(k kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	if k == nil {
 		return key, Errorf("KMS not configured")
 	}
 
@@ -109,7 +120,7 @@ func (s3 ssekms) UnsealObjectKey(KMS kms.KMS, metadata map[string]string, bucket
 	} else if _, ok := ctx[bucket]; !ok {
 		ctx[bucket] = path.Join(bucket, object)
 	}
-	unsealKey, err := KMS.DecryptKey(keyID, kmsKey, ctx)
+	unsealKey, err := k.DecryptKey(keyID, kmsKey, ctx)
 	if err != nil {
 		return key, err
 	}

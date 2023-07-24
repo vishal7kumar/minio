@@ -34,7 +34,8 @@ func TestBucketLifecycleWrongCredentials(t *testing.T) {
 
 // Test for authentication
 func testBucketLifecycleHandlersWrongCredentials(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	credentials auth.Credentials, t *testing.T) {
+	credentials auth.Credentials, t *testing.T,
+) {
 	// test cases with sample input and expected output.
 	testCases := []struct {
 		method     string
@@ -178,7 +179,7 @@ func testBucketLifecycleHandlers(obj ObjectLayer, instanceType, bucketName strin
 			lifecycleResponse:  []byte(``),
 			errorResponse: APIErrorResponse{
 				Resource: SlashSeparator + bucketName + SlashSeparator,
-				Code:     "InvalidRequest",
+				Code:     "InvalidArgument",
 				Message:  "Filter must have exactly one of Prefix, Tag, or And specified",
 			},
 
@@ -195,7 +196,7 @@ func testBucketLifecycleHandlers(obj ObjectLayer, instanceType, bucketName strin
 			lifecycleResponse:  []byte(``),
 			errorResponse: APIErrorResponse{
 				Resource: SlashSeparator + bucketName + SlashSeparator,
-				Code:     "InvalidRequest",
+				Code:     "InvalidArgument",
 				Message:  "Date must be provided in ISO 8601 format",
 			},
 

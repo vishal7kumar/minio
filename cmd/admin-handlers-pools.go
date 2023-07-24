@@ -19,17 +19,23 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 
-	"github.com/gorilla/mux"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/mux"
 	iampolicy "github.com/minio/pkg/iam/policy"
 )
 
-func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "StartDecommission")
+var (
+	errRebalanceDecommissionAlreadyRunning = errors.New("Rebalance cannot be started, decommission is already in progress")
+	errDecommissionRebalanceAlreadyRunning = errors.New("Decommission cannot be started, rebalance is already in progress")
+)
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DecommissionAdminAction)
 	if objectAPI == nil {
@@ -42,32 +48,70 @@ func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	pools, ok := objectAPI.(*erasureServerPools)
-	if !ok {
+	z, ok := objectAPI.(*erasureServerPools)
+	if !ok || len(z.serverPools) == 1 {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	if z.IsDecommissionRunning() {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errDecommissionAlreadyRunning), r.URL)
+		return
+	}
+
+	if z.IsRebalanceStarted() {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminRebalanceAlreadyStarted), r.URL)
 		return
 	}
 
 	vars := mux.Vars(r)
 	v := vars["pool"]
 
-	idx := globalEndpoints.GetPoolIdx(v)
-	if idx == -1 {
-		// We didn't find any matching pools, invalid input
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
-		return
+	pools := strings.Split(v, ",")
+	poolIndices := make([]int, 0, len(pools))
+
+	for _, pool := range pools {
+		idx := globalEndpoints.GetPoolIdx(pool)
+		if idx == -1 {
+			// We didn't find any matching pools, invalid input
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
+			return
+		}
+		var pool *erasureSets
+		for pidx := range z.serverPools {
+			if pidx == idx {
+				pool = z.serverPools[idx]
+				break
+			}
+		}
+		if pool == nil {
+			// We didn't find any matching pools, invalid input
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
+			return
+		}
+
+		poolIndices = append(poolIndices, idx)
 	}
 
-	if err := pools.Decommission(r.Context(), idx); err != nil {
+	if len(poolIndices) > 0 && !globalEndpoints[poolIndices[0]].Endpoints[0].IsLocal {
+		ep := globalEndpoints[poolIndices[0]].Endpoints[0]
+		for nodeIdx, proxyEp := range globalProxyEndpoints {
+			if proxyEp.Endpoint.Host == ep.Host {
+				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+					return
+				}
+			}
+		}
+	}
+
+	if err := z.Decommission(r.Context(), poolIndices...); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 }
 
 func (a adminAPIHandlers) CancelDecommission(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "CancelDecommission")
-
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DecommissionAdminAction)
 	if objectAPI == nil {
@@ -94,6 +138,16 @@ func (a adminAPIHandlers) CancelDecommission(w http.ResponseWriter, r *http.Requ
 		// We didn't find any matching pools, invalid input
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
 		return
+	}
+
+	if ep := globalEndpoints[idx].Endpoints[0]; !ep.IsLocal {
+		for nodeIdx, proxyEp := range globalProxyEndpoints {
+			if proxyEp.Endpoint.Host == ep.Host {
+				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+					return
+				}
+			}
+		}
 	}
 
 	if err := pools.DecommissionCancel(ctx, idx); err != nil {
@@ -103,9 +157,7 @@ func (a adminAPIHandlers) CancelDecommission(w http.ResponseWriter, r *http.Requ
 }
 
 func (a adminAPIHandlers) StatusPool(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "StatusPool")
-
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerInfoAdminAction, iampolicy.DecommissionAdminAction)
 	if objectAPI == nil {
@@ -129,8 +181,10 @@ func (a adminAPIHandlers) StatusPool(w http.ResponseWriter, r *http.Request) {
 
 	idx := globalEndpoints.GetPoolIdx(v)
 	if idx == -1 {
+		apiErr := toAdminAPIErr(ctx, errInvalidArgument)
+		apiErr.Description = fmt.Sprintf("specified pool '%s' not found, please specify a valid pool", v)
 		// We didn't find any matching pools, invalid input
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
+		writeErrorResponseJSON(ctx, w, apiErr, r.URL)
 		return
 	}
 
@@ -144,9 +198,7 @@ func (a adminAPIHandlers) StatusPool(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a adminAPIHandlers) ListPools(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListPools")
-
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerInfoAdminAction, iampolicy.DecommissionAdminAction)
 	if objectAPI == nil {
@@ -176,4 +228,135 @@ func (a adminAPIHandlers) ListPools(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logger.LogIf(r.Context(), json.NewEncoder(w).Encode(poolsStatus))
+}
+
+func (a adminAPIHandlers) RebalanceStart(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	// NB rebalance-start admin API is always coordinated from first pool's
+	// first node. The following is required to serialize (the effects of)
+	// concurrent rebalance-start commands.
+	if ep := globalEndpoints[0].Endpoints[0]; !ep.IsLocal {
+		for nodeIdx, proxyEp := range globalProxyEndpoints {
+			if proxyEp.Endpoint.Host == ep.Host {
+				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+					return
+				}
+			}
+		}
+	}
+
+	pools, ok := objectAPI.(*erasureServerPools)
+	if !ok || len(pools.serverPools) == 1 {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	if pools.IsDecommissionRunning() {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errRebalanceDecommissionAlreadyRunning), r.URL)
+		return
+	}
+
+	if pools.IsRebalanceStarted() {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminRebalanceAlreadyStarted), r.URL)
+		return
+	}
+
+	bucketInfos, err := objectAPI.ListBuckets(ctx, BucketOptions{})
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	buckets := make([]string, 0, len(bucketInfos))
+	for _, bInfo := range bucketInfos {
+		buckets = append(buckets, bInfo.Name)
+	}
+
+	var id string
+	if id, err = pools.initRebalanceMeta(ctx, buckets); err != nil {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	// Rebalance routine is run on the first node of any pool participating in rebalance.
+	pools.StartRebalance()
+
+	b, err := json.Marshal(struct {
+		ID string `json:"id"`
+	}{ID: id})
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	writeSuccessResponseJSON(w, b)
+	// Notify peers to load rebalance.bin and start rebalance routine if they happen to be
+	// participating pool's leader node
+	globalNotificationSys.LoadRebalanceMeta(ctx, true)
+}
+
+func (a adminAPIHandlers) RebalanceStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	// Proxy rebalance-status to first pool first node, so that users see a
+	// consistent view of rebalance progress even though different rebalancing
+	// pools may temporarily have out of date info on the others.
+	if ep := globalEndpoints[0].Endpoints[0]; !ep.IsLocal {
+		for nodeIdx, proxyEp := range globalProxyEndpoints {
+			if proxyEp.Endpoint.Host == ep.Host {
+				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+					return
+				}
+			}
+		}
+	}
+
+	pools, ok := objectAPI.(*erasureServerPools)
+	if !ok {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	rs, err := rebalanceStatus(ctx, pools)
+	if err != nil {
+		if errors.Is(err, errRebalanceNotStarted) || errors.Is(err, errConfigNotFound) {
+			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminRebalanceNotStarted), r.URL)
+			return
+		}
+		logger.LogIf(ctx, fmt.Errorf("failed to fetch rebalance status: %w", err))
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	logger.LogIf(r.Context(), json.NewEncoder(w).Encode(rs))
+}
+
+func (a adminAPIHandlers) RebalanceStop(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	pools, ok := objectAPI.(*erasureServerPools)
+	if !ok {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	// Cancel any ongoing rebalance operation
+	globalNotificationSys.StopRebalance(r.Context())
+	writeSuccessResponseHeadersOnly(w)
+	logger.LogIf(ctx, pools.saveRebalanceStats(GlobalContext, 0, rebalSaveStoppedAt))
 }

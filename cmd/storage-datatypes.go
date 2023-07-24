@@ -21,21 +21,35 @@ import (
 	"time"
 )
 
+// DeleteOptions represents the disk level delete options available for the APIs
+//
+//msgp:ignore DeleteOptions
+type DeleteOptions struct {
+	Recursive bool
+	Force     bool
+}
+
 //go:generate msgp -file=$GOFILE
 
 // DiskInfo is an extended type which returns current
 // disk usage per path.
-//msgp:tuple DiskInfo
 // The above means that any added/deleted fields are incompatible.
+//
+// The above means that any added/deleted fields are incompatible.
+//
+//msgp:tuple DiskInfo
 type DiskInfo struct {
 	Total      uint64
 	Free       uint64
 	Used       uint64
 	UsedInodes uint64
 	FreeInodes uint64
+	Major      uint32
+	Minor      uint32
 	FSType     string
 	RootDisk   bool
 	Healing    bool
+	Scanning   bool
 	Endpoint   string
 	MountPath  string
 	ID         string
@@ -47,16 +61,19 @@ type DiskInfo struct {
 // the number of calls of each API and the moving average of
 // the duration of each API.
 type DiskMetrics struct {
-	APILatencies map[string]uint64 `json:"apiLatencies,omitempty"`
-	APICalls     map[string]uint64 `json:"apiCalls,omitempty"`
+	LastMinute map[string]AccElem `json:"apiLatencies,omitempty"`
+	APICalls   map[string]uint64  `json:"apiCalls,omitempty"`
 }
 
 // VolsInfo is a collection of volume(bucket) information
 type VolsInfo []VolInfo
 
 // VolInfo - represents volume stat information.
-//msgp:tuple VolInfo
 // The above means that any added/deleted fields are incompatible.
+//
+// The above means that any added/deleted fields are incompatible.
+//
+//msgp:tuple VolInfo
 type VolInfo struct {
 	// Name of the volume.
 	Name string
@@ -67,6 +84,8 @@ type VolInfo struct {
 
 // FilesInfo represent a list of files, additionally
 // indicates if the list is last.
+//
+//msgp:tuple FileInfo
 type FilesInfo struct {
 	Files       []FileInfo
 	IsTruncated bool
@@ -81,8 +100,11 @@ func (f FileInfoVersions) Size() (size int64) {
 }
 
 // FileInfoVersions represent a list of versions for a given file.
-//msgp:tuple FileInfoVersions
 // The above means that any added/deleted fields are incompatible.
+//
+// The above means that any added/deleted fields are incompatible.
+//
+//msgp:tuple FileInfoVersions
 type FileInfoVersions struct {
 	// Name of the volume.
 	Volume string `msg:"v,omitempty"`
@@ -112,9 +134,22 @@ func (f *FileInfoVersions) findVersionIndex(v string) int {
 	return -1
 }
 
-// FileInfo - represents file stat information.
-//msgp:tuple FileInfo
+// RawFileInfo - represents raw file stat information as byte array.
 // The above means that any added/deleted fields are incompatible.
+// Make sure to bump the internode version at storage-rest-common.go
+type RawFileInfo struct {
+	// Content of entire xl.meta (may contain data depending on what was requested by the caller.
+	Buf []byte `msg:"b"`
+
+	// DiskMTime indicates the mtime of the xl.meta on disk
+	// This is mainly used for detecting a particular issue
+	// reported in https://github.com/minio/minio/pull/13803
+	DiskMTime time.Time `msg:"dmt"`
+}
+
+// FileInfo - represents file stat information.
+// The above means that any added/deleted fields are incompatible.
+// Make sure to bump the internode version at storage-rest-common.go
 type FileInfo struct {
 	// Name of the volume.
 	Volume string `msg:"v,omitempty"`
@@ -162,6 +197,10 @@ type FileInfo struct {
 	// File mode bits.
 	Mode uint32 `msg:"m"`
 
+	// WrittenByVersion is the unix time stamp of the MinIO
+	// version that created this version of the object.
+	WrittenByVersion uint64 `msg:"wv"`
+
 	// File metadata
 	Metadata map[string]string `msg:"meta"`
 
@@ -190,6 +229,29 @@ type FileInfo struct {
 	// This is mainly used for detecting a particular issue
 	// reported in https://github.com/minio/minio/pull/13803
 	DiskMTime time.Time `msg:"dmt"`
+
+	// Combined checksum when object was uploaded.
+	Checksum []byte `msg:"cs,allownil"`
+}
+
+// WriteQuorum returns expected write quorum for this FileInfo
+func (fi FileInfo) WriteQuorum(dquorum int) int {
+	if fi.Deleted {
+		return dquorum
+	}
+	quorum := fi.Erasure.DataBlocks
+	if fi.Erasure.DataBlocks == fi.Erasure.ParityBlocks {
+		quorum++
+	}
+	return quorum
+}
+
+// ReadQuorum returns expected read quorum for this FileInfo
+func (fi FileInfo) ReadQuorum(dquorum int) int {
+	if fi.Deleted {
+		return dquorum
+	}
+	return fi.Erasure.DataBlocks
 }
 
 // Equals checks if fi(FileInfo) matches ofi(FileInfo)
@@ -203,14 +265,17 @@ func (fi FileInfo) Equals(ofi FileInfo) (ok bool) {
 	if !fi.TransitionInfoEquals(ofi) {
 		return false
 	}
-	return fi.ModTime.Equal(ofi.ModTime)
+	if !fi.ModTime.Equal(ofi.ModTime) {
+		return false
+	}
+	return fi.Erasure.Equal(ofi.Erasure)
 }
 
 // GetDataDir returns an expected dataDir given FileInfo
-// - deleteMarker returns "delete-marker"
-// - returns "legacy" if FileInfo is XLV1 and DataDir is
-//   empty, returns DataDir otherwise
-// - returns "dataDir"
+//   - deleteMarker returns "delete-marker"
+//   - returns "legacy" if FileInfo is XLV1 and DataDir is
+//     empty, returns DataDir otherwise
+//   - returns "dataDir"
 func (fi FileInfo) GetDataDir() string {
 	if fi.Deleted {
 		return "delete-marker"
@@ -250,4 +315,26 @@ func newFileInfo(object string, dataBlocks, parityBlocks int) (fi FileInfo) {
 		Distribution: hashOrder(object, dataBlocks+parityBlocks),
 	}
 	return fi
+}
+
+// ReadMultipleReq contains information of multiple files to read from disk.
+type ReadMultipleReq struct {
+	Bucket       string   // Bucket. Can be empty if multiple buckets.
+	Prefix       string   // Shared prefix of all files. Can be empty. Will be joined to filename without modification.
+	Files        []string // Individual files to read.
+	MaxSize      int64    // Return error if size is exceed.
+	MetadataOnly bool     // Read as XL meta and truncate data.
+	AbortOn404   bool     // Stop reading after first file not found.
+	MaxResults   int      // Stop after this many successful results. <= 0 means all.
+}
+
+// ReadMultipleResp contains a single response from a ReadMultipleReq.
+type ReadMultipleResp struct {
+	Bucket  string    // Bucket as given by request.
+	Prefix  string    // Prefix as given by request.
+	File    string    // File name as given in request.
+	Exists  bool      // Returns whether the file existed on disk.
+	Error   string    // Returns any error when reading.
+	Data    []byte    // Contains all data of file.
+	Modtime time.Time // Modtime of file on disk.
 }

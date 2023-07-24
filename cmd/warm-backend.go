@@ -24,7 +24,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
+	xhttp "github.com/minio/minio/internal/http"
 )
 
 // WarmBackendGetOpts is used to express byte ranges within an object. The zero
@@ -50,8 +51,7 @@ func checkWarmBackend(ctx context.Context, w WarmBackend) error {
 	var empty bytes.Reader
 	rv, err := w.Put(ctx, probeObject, &empty, 0)
 	if err != nil {
-		switch err.(type) {
-		case BackendDown:
+		if _, ok := err.(BackendDown); ok {
 			return err
 		}
 		return tierPermErr{
@@ -60,10 +60,10 @@ func checkWarmBackend(ctx context.Context, w WarmBackend) error {
 		}
 	}
 
-	_, err = w.Get(ctx, probeObject, rv, WarmBackendGetOpts{})
+	r, err := w.Get(ctx, probeObject, rv, WarmBackendGetOpts{})
+	xhttp.DrainBody(r)
 	if err != nil {
-		switch err.(type) {
-		case BackendDown:
+		if _, ok := err.(BackendDown); ok {
 			return err
 		}
 		switch {
@@ -78,10 +78,8 @@ func checkWarmBackend(ctx context.Context, w WarmBackend) error {
 			}
 		}
 	}
-
 	if err = w.Remove(ctx, probeObject, rv); err != nil {
-		switch err.(type) {
-		case BackendDown:
+		if _, ok := err.(BackendDown); ok {
 			return err
 		}
 		return tierPermErr{
@@ -136,11 +134,13 @@ type remoteVersionID string
 func newWarmBackend(ctx context.Context, tier madmin.TierConfig) (d WarmBackend, err error) {
 	switch tier.Type {
 	case madmin.S3:
-		d, err = newWarmBackendS3(*tier.S3)
+		d, err = newWarmBackendS3(*tier.S3, tier.Name)
 	case madmin.Azure:
-		d, err = newWarmBackendAzure(*tier.Azure)
+		d, err = newWarmBackendAzure(*tier.Azure, tier.Name)
 	case madmin.GCS:
-		d, err = newWarmBackendGCS(*tier.GCS)
+		d, err = newWarmBackendGCS(*tier.GCS, tier.Name)
+	case madmin.MinIO:
+		d, err = newWarmBackendMinIO(*tier.MinIO, tier.Name)
 	default:
 		return nil, errTierTypeUnsupported
 	}

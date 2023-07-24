@@ -27,26 +27,26 @@ const (
 	// FSSetupType - FS setup type enum.
 	FSSetupType
 
+	// ErasureSDSetupType - Erasure single drive setup enum.
+	ErasureSDSetupType
+
 	// ErasureSetupType - Erasure setup type enum.
 	ErasureSetupType
 
 	// DistErasureSetupType - Distributed Erasure setup type enum.
 	DistErasureSetupType
-
-	// GatewaySetupType - gateway setup type enum.
-	GatewaySetupType
 )
 
 func (setupType SetupType) String() string {
 	switch setupType {
 	case FSSetupType:
 		return globalMinioModeFS
+	case ErasureSDSetupType:
+		return globalMinioModeErasureSD
 	case ErasureSetupType:
 		return globalMinioModeErasure
 	case DistErasureSetupType:
 		return globalMinioModeDistErasure
-	case GatewaySetupType:
-		return globalMinioModeGatewayPrefix
 	}
 
 	return "unknown"

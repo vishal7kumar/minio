@@ -18,25 +18,21 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
-	"mime/multipart"
-	"net"
 	"net/http"
 	"net/textproto"
-	"net/url"
 	"regexp"
 	"strings"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/mcontext"
+	xnet "github.com/minio/pkg/net"
 )
 
 const (
@@ -52,7 +48,7 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 	locationConstraint := createBucketLocationConfiguration{}
 	err := xmlDecoder(r.Body, &locationConstraint, r.ContentLength)
 	if err != nil && r.ContentLength != 0 {
-		logger.LogIf(GlobalContext, err)
+		logger.LogOnceIf(GlobalContext, err, "location-constraint-xml-parsing")
 		// Treat all other failures as XML parsing errors.
 		return "", ErrMalformedXML
 	} // else for both err as nil or io.EOF
@@ -60,6 +56,10 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 	if location == "" {
 		location = globalSite.Region
 	}
+	if !isValidLocation(location) {
+		return location, ErrInvalidRegion
+	}
+
 	return location, ErrNone
 }
 
@@ -184,7 +184,7 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 
 	for key := range v {
 		for _, prefix := range userMetadataKeyPrefixes {
-			if !strings.HasPrefix(strings.ToLower(key), strings.ToLower(prefix)) {
+			if !stringsHasPrefixFold(key, prefix) {
 				continue
 			}
 			value, ok := nv[http.CanonicalHeaderKey(key)]
@@ -195,16 +195,6 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 		}
 	}
 	return nil
-}
-
-// The Query string for the redirect URL the client is
-// redirected on successful upload.
-func getRedirectPostRawQuery(objInfo ObjectInfo) string {
-	redirectValues := make(url.Values)
-	redirectValues.Set("bucket", objInfo.Bucket)
-	redirectValues.Set("key", objInfo.Name)
-	redirectValues.Set("etag", "\""+objInfo.ETag+"\"")
-	return redirectValues.Encode()
 }
 
 // Returns access credentials in the request Authorization header.
@@ -237,6 +227,10 @@ func extractReqParams(r *http.Request) map[string]string {
 		"sourceIPAddress": handlers.GetSourceIP(r),
 		// Add more fields here.
 	}
+	if rangeField := r.Header.Get(xhttp.Range); rangeField != "" {
+		m["range"] = rangeField
+	}
+
 	if _, ok := r.Header[xhttp.MinIOSourceReplicationRequest]; ok {
 		m[xhttp.MinIOSourceReplicationRequest] = ""
 	}
@@ -250,6 +244,7 @@ func extractRespElements(w http.ResponseWriter) map[string]string {
 	}
 	return map[string]string{
 		"requestId":      w.Header().Get(xhttp.AmzRequestID),
+		"nodeId":         w.Header().Get(xhttp.AmzRequestHostID),
 		"content-length": w.Header().Get(xhttp.ContentLength),
 		// Add more fields here.
 	}
@@ -272,121 +267,60 @@ func trimAwsChunkedContentEncoding(contentEnc string) (trimmedContentEnc string)
 	return strings.Join(newEncs, ",")
 }
 
-// Validate form field size for s3 specification requirement.
-func validateFormFieldSize(ctx context.Context, formValues http.Header) error {
-	// Iterate over form values
-	for k := range formValues {
-		// Check if value's field exceeds S3 limit
-		if int64(len(formValues.Get(k))) > maxFormFieldSize {
-			logger.LogIf(ctx, errSizeUnexpected)
-			return errSizeUnexpected
-		}
-	}
-
-	// Success.
-	return nil
-}
-
-// Extract form fields and file data from a HTTP POST Policy
-func extractPostPolicyFormValues(ctx context.Context, form *multipart.Form) (filePart io.ReadCloser, fileName string, fileSize int64, formValues http.Header, err error) {
-	// HTML Form values
-	fileName = ""
-
-	// Canonicalize the form values into http.Header.
-	formValues = make(http.Header)
-	for k, v := range form.Value {
-		formValues[http.CanonicalHeaderKey(k)] = v
-	}
-
-	// Validate form values.
-	if err = validateFormFieldSize(ctx, formValues); err != nil {
-		return nil, "", 0, nil, err
-	}
-
-	// this means that filename="" was not specified for file key and Go has
-	// an ugly way of handling this situation. Refer here
-	// https://golang.org/src/mime/multipart/formdata.go#L61
-	if len(form.File) == 0 {
-		b := &bytes.Buffer{}
-		for _, v := range formValues["File"] {
-			b.WriteString(v)
-		}
-		fileSize = int64(b.Len())
-		filePart = ioutil.NopCloser(b)
-		return filePart, fileName, fileSize, formValues, nil
-	}
-
-	// Iterator until we find a valid File field and break
-	for k, v := range form.File {
-		canonicalFormName := http.CanonicalHeaderKey(k)
-		if canonicalFormName == "File" {
-			if len(v) == 0 {
-				logger.LogIf(ctx, errInvalidArgument)
-				return nil, "", 0, nil, errInvalidArgument
-			}
-			// Fetch fileHeader which has the uploaded file information
-			fileHeader := v[0]
-			// Set filename
-			fileName = fileHeader.Filename
-			// Open the uploaded part
-			filePart, err = fileHeader.Open()
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return nil, "", 0, nil, err
-			}
-			// Compute file size
-			fileSize, err = filePart.(io.Seeker).Seek(0, 2)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return nil, "", 0, nil, err
-			}
-			// Reset Seek to the beginning
-			_, err = filePart.(io.Seeker).Seek(0, 0)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return nil, "", 0, nil, err
-			}
-			// File found and ready for reading
-			break
-		}
-	}
-	return filePart, fileName, fileSize, formValues, nil
-}
-
-// Log headers and body.
-func httpTraceAll(f http.HandlerFunc) http.HandlerFunc {
+func collectInternodeStats(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if globalTrace.NumSubscribers() == 0 {
-			f.ServeHTTP(w, r)
+		f.ServeHTTP(w, r)
+
+		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+		if !ok || tc == nil {
 			return
 		}
-		trace := Trace(f, true, w, r)
-		globalTrace.Publish(trace)
-	}
-}
 
-// Log only the headers.
-func httpTraceHdrs(f http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if globalTrace.NumSubscribers() == 0 {
-			f.ServeHTTP(w, r)
-			return
-		}
-		trace := Trace(f, false, w, r)
-		globalTrace.Publish(trace)
+		globalConnStats.incInternodeInputBytes(int64(tc.RequestRecorder.Size()))
+		globalConnStats.incInternodeOutputBytes(int64(tc.ResponseRecorder.Size()))
 	}
 }
 
 func collectAPIStats(api string, f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		resource, err := getResource(r.URL.Path, r.Host, globalDomainNames)
+		if err != nil {
+			defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
+
+			apiErr := errorCodes.ToAPIErr(ErrUnsupportedHostHeader)
+			apiErr.Description = fmt.Sprintf("%s: %v", apiErr.Description, err)
+
+			writeErrorResponse(r.Context(), w, apiErr, r.URL)
+			return
+		}
+
+		bucket, _ := path2BucketObject(resource)
+
 		globalHTTPStats.currentS3Requests.Inc(api)
 		defer globalHTTPStats.currentS3Requests.Dec(api)
 
-		statsWriter := logger.NewResponseWriter(w)
+		if bucket != "" && bucket != minioReservedBucket {
+			globalBucketHTTPStats.updateHTTPStats(bucket, api, nil)
+		}
 
-		f.ServeHTTP(statsWriter, r)
+		f.ServeHTTP(w, r)
 
-		globalHTTPStats.updateStats(api, r, statsWriter)
+		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+		if !ok {
+			return
+		}
+
+		if tc != nil {
+			globalHTTPStats.updateStats(api, tc.ResponseRecorder)
+			globalConnStats.incS3InputBytes(int64(tc.RequestRecorder.Size()))
+			globalConnStats.incS3OutputBytes(int64(tc.ResponseRecorder.Size()))
+
+			if bucket != "" && bucket != minioReservedBucket {
+				globalBucketConnStats.incS3InputBytes(bucket, int64(tc.RequestRecorder.Size()))
+				globalBucketConnStats.incS3OutputBytes(bucket, int64(tc.ResponseRecorder.Size()))
+				globalBucketHTTPStats.updateHTTPStats(bucket, api, tc.ResponseRecorder)
+			}
+		}
 	}
 }
 
@@ -395,26 +329,21 @@ func getResource(path string, host string, domains []string) (string, error) {
 	if len(domains) == 0 {
 		return path, nil
 	}
+
 	// If virtual-host-style is enabled construct the "resource" properly.
-	if strings.Contains(host, ":") {
-		// In bucket.mydomain.com:9000, strip out :9000
-		var err error
-		if host, _, err = net.SplitHostPort(host); err != nil {
-			reqInfo := (&logger.ReqInfo{}).AppendTags("host", host)
-			reqInfo.AppendTags("path", path)
-			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
-			logger.LogIf(ctx, err)
-			return "", err
-		}
+	xhost, err := xnet.ParseHost(host)
+	if err != nil {
+		return "", err
 	}
+
 	for _, domain := range domains {
-		if host == minioReservedBucket+"."+domain {
+		if xhost.Name == minioReservedBucket+"."+domain {
 			continue
 		}
-		if !strings.HasSuffix(host, "."+domain) {
+		if !strings.HasSuffix(xhost.Name, "."+domain) {
 			continue
 		}
-		bucket := strings.TrimSuffix(host, "."+domain)
+		bucket := strings.TrimSuffix(xhost.Name, "."+domain)
 		return SlashSeparator + pathJoin(bucket, path), nil
 	}
 	return path, nil
@@ -440,6 +369,12 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	desc := "Do not upgrade one server at a time - please follow the recommended guidelines mentioned here https://github.com/minio/minio#upgrading-minio for your environment"
 	switch {
+	case strings.HasPrefix(r.URL.Path, peerS3Prefix):
+		writeErrorResponseString(r.Context(), w, APIError{
+			Code:           "XMinioPeerS3VersionMismatch",
+			Description:    desc,
+			HTTPStatusCode: http.StatusUpgradeRequired,
+		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, peerRESTPrefix):
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioPeerVersionMismatch",

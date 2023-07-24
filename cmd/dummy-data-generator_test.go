@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"testing"
 )
 
@@ -45,10 +44,10 @@ type DummyDataGen struct {
 //
 // Given the function:
 //
-// f := func(r io.Reader) string {
-//           b, _ := ioutil.ReadAll(r)
-//           return string(b)
-// }
+//	f := func(r io.Reader) string {
+//	          b, _ := io.ReadAll(r)
+//	          return string(b)
+//	}
 //
 // for example, the following is true:
 //
@@ -115,7 +114,7 @@ func (d *DummyDataGen) Seek(offset int64, whence int) (int64, error) {
 
 func TestDummyDataGenerator(t *testing.T) {
 	readAll := func(r io.Reader) string {
-		b, _ := ioutil.ReadAll(r)
+		b, _ := io.ReadAll(r)
 		return string(b)
 	}
 	checkEq := func(a, b string) {

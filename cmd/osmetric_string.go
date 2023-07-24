@@ -10,20 +10,26 @@ func _() {
 	var x [1]struct{}
 	_ = x[osMetricRemoveAll-0]
 	_ = x[osMetricMkdirAll-1]
-	_ = x[osMetricRename-2]
-	_ = x[osMetricOpenFile-3]
-	_ = x[osMetricOpen-4]
-	_ = x[osMetricOpenFileDirectIO-5]
-	_ = x[osMetricLstat-6]
-	_ = x[osMetricRemove-7]
-	_ = x[osMetricStat-8]
-	_ = x[osMetricAccess-9]
-	_ = x[osMetricLast-10]
+	_ = x[osMetricMkdir-2]
+	_ = x[osMetricRename-3]
+	_ = x[osMetricOpenFileW-4]
+	_ = x[osMetricOpenFileR-5]
+	_ = x[osMetricOpen-6]
+	_ = x[osMetricOpenFileDirectIO-7]
+	_ = x[osMetricLstat-8]
+	_ = x[osMetricRemove-9]
+	_ = x[osMetricStat-10]
+	_ = x[osMetricAccess-11]
+	_ = x[osMetricCreate-12]
+	_ = x[osMetricReadDirent-13]
+	_ = x[osMetricFdatasync-14]
+	_ = x[osMetricSync-15]
+	_ = x[osMetricLast-16]
 }
 
-const _osMetric_name = "RemoveAllMkdirAllRenameOpenFileOpenOpenFileDirectIOLstatRemoveStatAccessLast"
+const _osMetric_name = "RemoveAllMkdirAllMkdirRenameOpenFileWOpenFileROpenOpenFileDirectIOLstatRemoveStatAccessCreateReadDirentFdatasyncSyncLast"
 
-var _osMetric_index = [...]uint8{0, 9, 17, 23, 31, 35, 51, 56, 62, 66, 72, 76}
+var _osMetric_index = [...]uint8{0, 9, 17, 22, 28, 37, 46, 50, 66, 71, 77, 81, 87, 93, 103, 112, 116, 120}
 
 func (i osMetric) String() string {
 	if i >= osMetric(len(_osMetric_index)-1) {

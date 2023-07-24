@@ -23,7 +23,7 @@ import (
 	"io"
 
 	"cloud.google.com/go/storage"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -101,7 +101,7 @@ func (gcs *warmBackendGCS) InUse(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func newWarmBackendGCS(conf madmin.TierGCS) (*warmBackendGCS, error) {
+func newWarmBackendGCS(conf madmin.TierGCS, _ string) (*warmBackendGCS, error) {
 	credsJSON, err := conf.GetCredentialJSON()
 	if err != nil {
 		return nil, err

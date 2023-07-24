@@ -30,12 +30,12 @@ type Name int
 
 // Values of event Name
 const (
-	ObjectAccessedAll Name = 1 + iota
-	ObjectAccessedGet
+	// Single event types (does not require expansion)
+
+	ObjectAccessedGet Name = 1 + iota
 	ObjectAccessedGetRetention
 	ObjectAccessedGetLegalHold
 	ObjectAccessedHead
-	ObjectCreatedAll
 	ObjectCreatedCompleteMultipartUpload
 	ObjectCreatedCopy
 	ObjectCreatedPost
@@ -44,32 +44,43 @@ const (
 	ObjectCreatedPutLegalHold
 	ObjectCreatedPutTagging
 	ObjectCreatedDeleteTagging
-	ObjectRemovedAll
 	ObjectRemovedDelete
 	ObjectRemovedDeleteMarkerCreated
 	BucketCreated
 	BucketRemoved
-	ObjectReplicationAll
 	ObjectReplicationFailed
 	ObjectReplicationComplete
 	ObjectReplicationMissedThreshold
 	ObjectReplicationReplicatedAfterThreshold
 	ObjectReplicationNotTracked
-	ObjectRestorePostInitiated
-	ObjectRestorePostCompleted
-	ObjectRestorePostAll
-	ObjectTransitionAll
+	ObjectRestorePost
+	ObjectRestoreCompleted
 	ObjectTransitionFailed
 	ObjectTransitionComplete
+	ObjectManyVersions
+	PrefixManyFolders
+
+	objectSingleTypesEnd
+	// Start Compound types that require expansion:
+
+	ObjectAccessedAll
+	ObjectCreatedAll
+	ObjectRemovedAll
+	ObjectReplicationAll
+	ObjectRestoreAll
+	ObjectTransitionAll
+	ObjectScannerAll
+	Everything
 )
+
+// The number of single names should not exceed 64.
+// This will break masking. Use bit 63 as extension.
+var _ = uint64(1 << objectSingleTypesEnd)
 
 // Expand - returns expanded values of abbreviated event type.
 func (name Name) Expand() []Name {
 	switch name {
-	case BucketCreated:
-		return []Name{BucketCreated}
-	case BucketRemoved:
-		return []Name{BucketRemoved}
+
 	case ObjectAccessedAll:
 		return []Name{
 			ObjectAccessedGet, ObjectAccessedHead,
@@ -95,19 +106,43 @@ func (name Name) Expand() []Name {
 			ObjectReplicationMissedThreshold,
 			ObjectReplicationReplicatedAfterThreshold,
 		}
-	case ObjectRestorePostAll:
+	case ObjectRestoreAll:
 		return []Name{
-			ObjectRestorePostInitiated,
-			ObjectRestorePostCompleted,
+			ObjectRestorePost,
+			ObjectRestoreCompleted,
 		}
 	case ObjectTransitionAll:
 		return []Name{
 			ObjectTransitionFailed,
 			ObjectTransitionComplete,
 		}
+	case ObjectScannerAll:
+		return []Name{
+			ObjectManyVersions,
+			PrefixManyFolders,
+		}
+	case Everything:
+		res := make([]Name, objectSingleTypesEnd-1)
+		for i := range res {
+			res[i] = Name(i + 1)
+		}
+		return res
 	default:
 		return []Name{name}
 	}
+}
+
+// Mask returns the type as mask.
+// Compound "All" types are expanded.
+func (name Name) Mask() uint64 {
+	if name < objectSingleTypesEnd {
+		return 1 << (name - 1)
+	}
+	var mask uint64
+	for _, n := range name.Expand() {
+		mask |= 1 << (n - 1)
+	}
+	return mask
 }
 
 // String - returns string representation of event type.
@@ -163,9 +198,11 @@ func (name Name) String() string {
 		return "s3:Replication:OperationMissedThreshold"
 	case ObjectReplicationReplicatedAfterThreshold:
 		return "s3:Replication:OperationReplicatedAfterThreshold"
-	case ObjectRestorePostInitiated:
+	case ObjectRestoreAll:
+		return "s3:ObjectRestore:*"
+	case ObjectRestorePost:
 		return "s3:ObjectRestore:Post"
-	case ObjectRestorePostCompleted:
+	case ObjectRestoreCompleted:
 		return "s3:ObjectRestore:Completed"
 	case ObjectTransitionAll:
 		return "s3:ObjectTransition:*"
@@ -173,6 +210,10 @@ func (name Name) String() string {
 		return "s3:ObjectTransition:Failed"
 	case ObjectTransitionComplete:
 		return "s3:ObjectTransition:Complete"
+	case ObjectManyVersions:
+		return "s3:Scanner:ManyVersions"
+	case PrefixManyFolders:
+		return "s3:Scanner:BigPrefix"
 	}
 
 	return ""
@@ -274,17 +315,21 @@ func ParseName(s string) (Name, error) {
 	case "s3:Replication:OperationNotTracked":
 		return ObjectReplicationNotTracked, nil
 	case "s3:ObjectRestore:*":
-		return ObjectRestorePostAll, nil
+		return ObjectRestoreAll, nil
 	case "s3:ObjectRestore:Post":
-		return ObjectRestorePostInitiated, nil
+		return ObjectRestorePost, nil
 	case "s3:ObjectRestore:Completed":
-		return ObjectRestorePostCompleted, nil
+		return ObjectRestoreCompleted, nil
 	case "s3:ObjectTransition:Failed":
 		return ObjectTransitionFailed, nil
 	case "s3:ObjectTransition:Complete":
 		return ObjectTransitionComplete, nil
 	case "s3:ObjectTransition:*":
 		return ObjectTransitionAll, nil
+	case "s3:Scanner:ManyVersions":
+		return ObjectManyVersions, nil
+	case "s3:Scanner:BigPrefix":
+		return PrefixManyFolders, nil
 	default:
 		return 0, &ErrInvalidEventName{s}
 	}

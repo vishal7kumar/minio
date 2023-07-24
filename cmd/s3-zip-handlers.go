@@ -20,16 +20,16 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"sort"
 	"strings"
 
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/crypto"
+	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/bucket/policy"
@@ -39,6 +39,7 @@ import (
 
 const (
 	archiveType            = "zip"
+	archiveTypeEnc         = "zip-enc"
 	archiveExt             = "." + archiveType // ".zip"
 	archiveSeparator       = "/"
 	archivePattern         = archiveExt + archiveSeparator                // ".zip/"
@@ -50,7 +51,8 @@ const (
 )
 
 // splitZipExtensionPath splits the S3 path to the zip file and the path inside the zip:
-//  e.g  /path/to/archive.zip/backup-2021/myimage.png => /path/to/archive.zip, backup/myimage.png
+//
+//	e.g  /path/to/archive.zip/backup-2021/myimage.png => /path/to/archive.zip, backup/myimage.png
 func splitZipExtensionPath(input string) (zipPath, object string, err error) {
 	idx := strings.Index(input, archivePattern)
 	if idx < 0 {
@@ -66,10 +68,6 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrBadRequest), r.URL)
 		return
 	}
-	if _, ok := crypto.IsRequested(r.Header); !objectAPI.IsEncryptionSupported() && ok {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrBadRequest), r.URL)
-		return
-	}
 
 	zipPath, object, err := splitZipExtensionPath(object)
 	if err != nil {
@@ -77,7 +75,6 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 		return
 	}
 
-	// get gateway encryption options
 	opts, err := getOpts(ctx, r, bucket, zipPath)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -109,7 +106,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 			if globalPolicySys.IsAllowed(policy.Args{
 				Action:          policy.ListBucketAction,
 				BucketName:      bucket,
-				ConditionValues: getConditionValues(r, "", "", nil),
+				ConditionValues: getConditionValues(r, "", auth.AnonymousCredentials),
 				IsOwner:         false,
 			}) {
 				_, err = getObjectInfo(ctx, bucket, zipPath, opts)
@@ -122,13 +119,22 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 		return
 	}
 
+	// We do not allow offsetting into extracted files.
+	if opts.PartNumber != 0 {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidPartNumber), r.URL)
+		return
+	}
+
+	if r.Header.Get(xhttp.Range) != "" {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidRange), r.URL)
+		return
+	}
+
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
-		if objectAPI.IsEncryptionSupported() {
-			if _, err := DecryptObjectInfo(&oi, r); err != nil {
-				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-				return true
-			}
+		if _, err := DecryptObjectInfo(&oi, r); err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return true
 		}
 
 		return checkPreconditions(ctx, w, r, oi, opts)
@@ -140,21 +146,16 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 		return
 	}
 
-	var zipInfo []byte
-
-	if z, ok := zipObjInfo.UserDefined[archiveInfoMetadataKey]; ok {
-		if globalIsErasure {
-			zipInfo = []byte(z)
-		} else {
-			zipInfo, err = base64.StdEncoding.DecodeString(z)
-			logger.LogIf(ctx, err)
-			// Will attempt to re-read...
-		}
-	}
+	zipInfo := zipObjInfo.ArchiveInfo()
 	if len(zipInfo) == 0 {
+		opts.EncryptFn, err = zipObjInfo.metadataEncryptFn(r.Header)
+		if err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+
 		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, opts)
 	}
-
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -180,9 +181,14 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 	var rc io.ReadCloser
 
 	if file.UncompressedSize64 > 0 {
-		// We do not know where the file ends, but the returned reader only returns UncompressedSize.
-		rs := &HTTPRangeSpec{Start: file.Offset, End: -1}
-		gr, err := objectAPI.GetObjectNInfo(ctx, bucket, zipPath, rs, nil, readLock, opts)
+		// There may be number of header bytes before the content.
+		// Reading 64K extra. This should more than cover name and any "extra" details.
+		end := file.Offset + int64(file.CompressedSize64) + 64<<10
+		if end > zipObjInfo.Size {
+			end = zipObjInfo.Size
+		}
+		rs := &HTTPRangeSpec{Start: file.Offset, End: end}
+		gr, err := objectAPI.GetObjectNInfo(ctx, bucket, zipPath, rs, nil, opts)
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -194,7 +200,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 			return
 		}
 	} else {
-		rc = ioutil.NopCloser(bytes.NewReader([]byte{}))
+		rc = io.NopCloser(bytes.NewReader([]byte{}))
 	}
 
 	defer rc.Close()
@@ -203,6 +209,8 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+	// s3zip does not allow ranges
+	w.Header().Del(xhttp.AcceptRanges)
 
 	setHeadGetRespHeaders(w, r.Form)
 
@@ -216,7 +224,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 			return
 		}
 		if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
-			logger.LogIf(ctx, fmt.Errorf("Unable to write all the data to client %w", err))
+			logger.LogIf(ctx, fmt.Errorf("Unable to write all the data to client: %w", err))
 		}
 		return
 	}
@@ -227,7 +235,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 			return
 		}
 		if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
-			logger.LogIf(ctx, fmt.Errorf("Unable to write all the data to client %w", err))
+			logger.LogIf(ctx, fmt.Errorf("Unable to write all the data to client: %w", err))
 		}
 		return
 	}
@@ -247,15 +255,11 @@ func listObjectsV2InArchive(ctx context.Context, objectAPI ObjectLayer, bucket, 
 		return ListObjectsV2Info{}, nil
 	}
 
-	var zipInfo []byte
-
-	if z, ok := zipObjInfo.UserDefined[archiveInfoMetadataKey]; ok {
-		zipInfo = []byte(z)
-	} else {
+	zipInfo := zipObjInfo.ArchiveInfo()
+	if len(zipInfo) == 0 {
 		// Always update the latest version
 		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, ObjectOptions{})
 	}
-
 	if err != nil {
 		return ListObjectsV2Info{}, err
 	}
@@ -327,16 +331,15 @@ func getFilesListFromZIPObject(ctx context.Context, objectAPI ObjectLayer, bucke
 	var objSize int64
 	for {
 		rs := &HTTPRangeSpec{IsSuffixLength: true, Start: int64(-size)}
-		gr, err := objectAPI.GetObjectNInfo(ctx, bucket, object, rs, nil, readLock, opts)
+		gr, err := objectAPI.GetObjectNInfo(ctx, bucket, object, rs, nil, opts)
 		if err != nil {
 			return nil, ObjectInfo{}, err
 		}
-		b, err := ioutil.ReadAll(gr)
-		if err != nil {
-			gr.Close()
-			return nil, ObjectInfo{}, err
-		}
+		b, err := io.ReadAll(gr)
 		gr.Close()
+		if err != nil {
+			return nil, ObjectInfo{}, err
+		}
 		if size > len(b) {
 			size = len(b)
 		}
@@ -371,10 +374,6 @@ func getFilesListFromZIPObject(ctx context.Context, objectAPI ObjectLayer, bucke
 func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context, objectAPI ObjectLayer, bucket, object string, w http.ResponseWriter, r *http.Request) {
 	if crypto.S3.IsRequested(r.Header) || crypto.S3KMS.IsRequested(r.Header) { // If SSE-S3 or SSE-KMS present -> AWS fails with undefined error
 		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrBadRequest))
-		return
-	}
-	if _, ok := crypto.IsRequested(r.Header); !objectAPI.IsEncryptionSupported() && ok {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrBadRequest), r.URL)
 		return
 	}
 
@@ -413,7 +412,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 			if globalPolicySys.IsAllowed(policy.Args{
 				Action:          policy.ListBucketAction,
 				BucketName:      bucket,
-				ConditionValues: getConditionValues(r, "", "", nil),
+				ConditionValues: getConditionValues(r, "", auth.AnonymousCredentials),
 				IsOwner:         false,
 			}) {
 				_, err = getObjectInfo(ctx, bucket, zipPath, opts)
@@ -422,41 +421,55 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 				}
 			}
 		}
-		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
+		errCode := errorCodes.ToAPIErr(s3Error)
+		w.Header().Set(xMinIOErrCodeHeader, errCode.Code)
+		w.Header().Set(xMinIOErrDescHeader, "\""+errCode.Description+"\"")
+		writeErrorResponseHeadersOnly(w, errCode)
 		return
 	}
-
-	var rs *HTTPRangeSpec
 
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
 		return checkPreconditions(ctx, w, r, oi, opts)
 	}
 
-	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
-	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+	// We do not allow offsetting into extracted files.
+	if opts.PartNumber != 0 {
+		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrInvalidPartNumber))
 		return
 	}
 
-	var zipInfo []byte
+	if r.Header.Get(xhttp.Range) != "" {
+		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrInvalidRange))
+		return
+	}
 
-	if z, ok := zipObjInfo.UserDefined[archiveInfoMetadataKey]; ok {
-		zipInfo = []byte(z)
-	} else {
+	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
+	if err != nil {
+		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
+		return
+	}
+
+	zipInfo := zipObjInfo.ArchiveInfo()
+	if len(zipInfo) == 0 {
+		opts.EncryptFn, err = zipObjInfo.metadataEncryptFn(r.Header)
+		if err != nil {
+			writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
+			return
+		}
 		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, opts)
 	}
 	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
 		return
 	}
 
 	file, err := zipindex.FindSerialized(zipInfo, object)
 	if err != nil {
 		if err == io.EOF {
-			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNoSuchKey), r.URL)
+			writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrNoSuchKey))
 		} else {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
 		}
 		return
 	}
@@ -474,18 +487,18 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 		return
 	}
 
+	// s3zip does not allow ranges.
+	w.Header().Del(xhttp.AcceptRanges)
+
 	// Set any additional requested response headers.
 	setHeadGetRespHeaders(w, r.Form)
 
 	// Successful response.
-	if rs != nil {
-		w.WriteHeader(http.StatusPartialContent)
-	} else {
-		w.WriteHeader(http.StatusOK)
-	}
+	w.WriteHeader(http.StatusOK)
 }
 
-// Update the passed zip object metadata with the zip contents info, file name, modtime, size, etc..
+// Update the passed zip object metadata with the zip contents info, file name, modtime, size, etc.
+// The returned zip index will de decrypted.
 func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer, bucket, object string, opts ObjectOptions) ([]byte, error) {
 	files, srcInfo, err := getFilesListFromZIPObject(ctx, objectAPI, bucket, object, opts)
 	if err != nil {
@@ -496,21 +509,25 @@ func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer,
 	if err != nil {
 		return nil, err
 	}
-
-	srcInfo.UserDefined[archiveTypeMetadataKey] = archiveType
-	if globalIsErasure {
-		srcInfo.UserDefined[archiveInfoMetadataKey] = string(zipInfo)
-	} else {
-		srcInfo.UserDefined[archiveInfoMetadataKey] = base64.StdEncoding.EncodeToString(zipInfo)
+	at := archiveType
+	zipInfoStr := string(zipInfo)
+	if opts.EncryptFn != nil {
+		at = archiveTypeEnc
+		zipInfoStr = string(opts.EncryptFn(archiveTypeEnc, zipInfo))
 	}
-	srcInfo.metadataOnly = true
+	srcInfo.UserDefined[archiveTypeMetadataKey] = at
+	popts := ObjectOptions{
+		MTime:     srcInfo.ModTime,
+		VersionID: srcInfo.VersionID,
+		EvalMetadataFn: func(oi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
+			oi.UserDefined[archiveTypeMetadataKey] = at
+			oi.UserDefined[archiveInfoMetadataKey] = zipInfoStr
+			return dsc, nil
+		},
+	}
 
-	// Always update the same version id & modtime
-
-	// Passing opts twice as source & destination options will update the metadata
-	// of the same object version to avoid creating a new version.
-	_, err = objectAPI.CopyObject(ctx, bucket, object, bucket, object, srcInfo, opts, opts)
-	if err != nil {
+	// For all other modes use in-place update to update metadata on a specific version.
+	if _, err = objectAPI.PutObjectMetadata(ctx, bucket, object, popts); err != nil {
 		return nil, err
 	}
 

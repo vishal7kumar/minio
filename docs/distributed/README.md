@@ -8,7 +8,7 @@ MinIO in distributed mode can help you setup a highly-available storage system w
 
 ### Data protection
 
-Distributed MinIO provides protection against multiple node/drive failures and [bit rot](https://github.com/minio/minio/blob/master/docs/erasure/README.md#what-is-bit-rot-protection) using [erasure code](https://docs.min.io/docs/minio-erasure-code-quickstart-guide). As the minimum disks required for distributed MinIO is 4 (same as minimum disks required for erasure coding), erasure code automatically kicks in as you launch distributed MinIO.
+Distributed MinIO provides protection against multiple node/drive failures and [bit rot](https://github.com/minio/minio/blob/master/docs/erasure/README.md#what-is-bit-rot-protection) using [erasure code](https://min.io/docs/minio/linux/operations/concepts/erasure-coding.html). As the minimum disks required for distributed MinIO is 2 (same as minimum disks required for erasure coding), erasure code automatically kicks in as you launch distributed MinIO.
 
 If one or more disks are offline at the start of a PutObject or NewMultipartUpload operation the object will have additional data protection bits added automatically to provide additional safety for these objects.
 
@@ -22,9 +22,11 @@ Refer to sizing guide for more understanding on default values chosen depending 
 
 ### Consistency Guarantees
 
-MinIO follows strict **read-after-write** and **list-after-write** consistency model for all i/o operations both in distributed and standalone modes. This consistency model is only guaranteed if you use disk filesystems such as xfs, ext4 or zfs etc.. for distributed setup.
+MinIO follows strict **read-after-write** and **list-after-write** consistency model for all i/o operations both in distributed and standalone modes. This consistency model is only guaranteed if you use disk filesystems such as xfs, zfs or btrfs etc.. for distributed setup.
 
-**If MinIO distributed setup is using NFS volumes underneath it is not guaranteed MinIO will provide these consistency guarantees since NFS is not consistent filesystem by design (If you must use NFS we recommend that you atleast use NFSv4 instead of NFSv3).**
+**In our tests we also found ext4 does not honor POSIX O_DIRECT/Fdatasync semantics, ext4 trades performance for consistency guarantees. Please avoid ext4 in your setup.**
+
+**If MinIO distributed setup is using NFS volumes underneath it is not guaranteed MinIO will provide these consistency guarantees since NFS is not strictly consistent (If you must use NFS we recommend that you atleast use NFSv4 instead of NFSv3 for relatively better outcomes).**
 
 ## Get started
 
@@ -32,7 +34,15 @@ If you're aware of stand-alone MinIO set up, the process remains largely the sam
 
 ### 1. Prerequisites
 
-Install MinIO - [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide).
+Install MinIO either on Kubernetes or Distributed Linux.
+
+Install MinIO on Kubernetes:
+
+- [MinIO Quickstart Guide for Kubernetes](https://min.io/docs/minio/kubernetes/upstream/index.html#quickstart-for-kubernetes).
+- [Deploy a Tenant from the MinIO Operator](https://min.io/docs/minio/kubernetes/upstream/operations/install-deploy-manage/deploy-minio-tenant.html)
+
+Install Distributed MinIO on Linux:
+- [Deploy Distributed MinIO on Linux](https://min.io/docs/minio/linux/operations/install-deploy-manage/deploy-minio-multi-node-multi-drive.html#deploy-distributed-minio)
 
 ### 2. Run distributed MinIO
 
@@ -41,7 +51,7 @@ To start a distributed MinIO instance, you just need to pass drive locations as 
 **NOTE:**
 
 - All the nodes running distributed MinIO should share a common root credentials, for the nodes to connect and trust each other. To achieve this, it is **recommended** to export root user and root password as environment variables, `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD`, on all the nodes before executing MinIO server command. If not exported, default `minioadmin/minioadmin` credentials shall be used.
-- **MinIO creates erasure-coding sets of _4_ to _16_ drives per set.  The number of drives you provide in total must be a multiple of one of those numbers.**
+- **MinIO creates erasure-coding sets of _2_ to _16_ drives per set.  The number of drives you provide in total must be a multiple of one of those numbers.**
 - **MinIO chooses the largest EC set size which divides into the total number of drives or total number of nodes given - making sure to keep the uniform distribution i.e each node participates equal number of drives per set**.
 - **Each object is written to a single EC set, and therefore is spread over no more than 16 drives.**
 - **All the nodes running distributed MinIO setup are recommended to be homogeneous, i.e. same operating system, same number of disks and same network interconnects.**
@@ -88,13 +98,12 @@ Now the server has expanded total storage by _(newly_added_servers\*m)_ more dis
 
 ## 3. Test your setup
 
-To test this setup, access the MinIO server via browser or [`mc`](https://docs.min.io/docs/minio-client-quickstart-guide).
+To test this setup, access the MinIO server via browser or [`mc`](https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart).
 
 ## Explore Further
 
-- [MinIO Erasure Code QuickStart Guide](https://docs.min.io/docs/minio-erasure-code-quickstart-guide)
-- [Use `mc` with MinIO Server](https://docs.min.io/docs/minio-client-quickstart-guide)
-- [Use `aws-cli` with MinIO Server](https://docs.min.io/docs/aws-cli-with-minio)
-- [Use `s3cmd` with MinIO Server](https://docs.min.io/docs/s3cmd-with-minio)
-- [Use `minio-go` SDK with MinIO Server](https://docs.min.io/docs/golang-client-quickstart-guide)
-- [The MinIO documentation website](https://docs.min.io)
+- [MinIO Erasure Code QuickStart Guide](https://min.io/docs/minio/linux/operations/concepts/erasure-coding.html)
+- [Use `mc` with MinIO Server](https://min.io/docs/minio/linux/reference/minio-mc.html)
+- [Use `aws-cli` with MinIO Server](https://min.io/docs/minio/linux/integrations/aws-cli-with-minio.html)
+- [Use `minio-go` SDK with MinIO Server](https://min.io/docs/minio/linux/developers/go/minio-go.html)
+- [The MinIO documentation website](https://min.io/docs/minio/linux/index.html)

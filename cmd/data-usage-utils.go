@@ -21,7 +21,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 )
 
 // BucketTargetUsageInfo - bucket target usage info provides
@@ -58,10 +58,13 @@ type BucketUsageInfo struct {
 	// Total number of objects that failed replication
 	ReplicationFailedCountV1 uint64 `json:"objectsFailedReplicationCount"`
 
-	ObjectsCount         uint64                           `json:"objectsCount"`
-	ObjectSizesHistogram map[string]uint64                `json:"objectsSizesHistogram"`
-	ReplicaSize          uint64                           `json:"objectReplicaTotalSize"`
-	ReplicationInfo      map[string]BucketTargetUsageInfo `json:"objectsReplicationInfo"`
+	ObjectsCount            uint64                           `json:"objectsCount"`
+	ObjectSizesHistogram    map[string]uint64                `json:"objectsSizesHistogram"`
+	ObjectVersionsHistogram map[string]uint64                `json:"objectsVersionsHistogram"`
+	VersionsCount           uint64                           `json:"versionsCount"`
+	DeleteMarkersCount      uint64                           `json:"deleteMarkersCount"`
+	ReplicaSize             uint64                           `json:"objectReplicaTotalSize"`
+	ReplicationInfo         map[string]BucketTargetUsageInfo `json:"objectsReplicationInfo"`
 }
 
 // DataUsageInfo represents data usage stats of the underlying Object API
@@ -72,6 +75,12 @@ type DataUsageInfo struct {
 
 	// Objects total count across all buckets
 	ObjectsTotalCount uint64 `json:"objectsCount"`
+
+	// Versions total count across all buckets
+	VersionsTotalCount uint64 `json:"versionsCount"`
+
+	// Delete markers total count across all buckets
+	DeleteMarkersTotalCount uint64 `json:"deleteMarkersCount"`
 
 	// Objects total size across all buckets
 	ObjectsTotalSize uint64                           `json:"objectsTotalSize"`

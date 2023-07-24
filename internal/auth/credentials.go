@@ -40,7 +40,7 @@ const (
 	// There is no max length enforcement for access keys
 	accessKeyMaxLen = 30
 
-	// Minimum length for MinIO secret key for both server and gateway mode.
+	// Minimum length for MinIO secret key for both server
 	secretKeyMinLen = 8
 
 	// Maximum secret key length for MinIO, this
@@ -60,6 +60,9 @@ var (
 	ErrInvalidAccessKeyLength = fmt.Errorf("access key length should be between %d and %d", accessKeyMinLen, accessKeyMaxLen)
 	ErrInvalidSecretKeyLength = fmt.Errorf("secret key length should be between %d and %d", secretKeyMinLen, secretKeyMaxLen)
 )
+
+// AnonymousCredentials simply points to empty credentials
+var AnonymousCredentials = Credentials{}
 
 // IsAccessKeyValid - validate access key for right length.
 func IsAccessKeyValid(accessKey string) bool {
@@ -85,6 +88,9 @@ var (
 	}
 )
 
+// claim key found in credentials which are service accounts
+const iamPolicyClaimNameSA = "sa-policy"
+
 const (
 	// AccountOn indicates that credentials are enabled
 	AccountOn = "on"
@@ -94,14 +100,21 @@ const (
 
 // Credentials holds access and secret keys.
 type Credentials struct {
-	AccessKey    string                 `xml:"AccessKeyId" json:"accessKey,omitempty"`
-	SecretKey    string                 `xml:"SecretAccessKey" json:"secretKey,omitempty"`
-	Expiration   time.Time              `xml:"Expiration" json:"expiration,omitempty"`
-	SessionToken string                 `xml:"SessionToken" json:"sessionToken,omitempty"`
+	AccessKey    string                 `xml:"AccessKeyId" json:"accessKey,omitempty" yaml:"accessKey"`
+	SecretKey    string                 `xml:"SecretAccessKey" json:"secretKey,omitempty" yaml:"secretKey"`
+	SessionToken string                 `xml:"SessionToken" json:"sessionToken,omitempty" yaml:"sessionToken"`
+	Expiration   time.Time              `xml:"Expiration" json:"expiration,omitempty" yaml:"-"`
 	Status       string                 `xml:"-" json:"status,omitempty"`
 	ParentUser   string                 `xml:"-" json:"parentUser,omitempty"`
 	Groups       []string               `xml:"-" json:"groups,omitempty"`
 	Claims       map[string]interface{} `xml:"-" json:"claims,omitempty"`
+	Name         string                 `xml:"-" json:"name,omitempty"`
+	Description  string                 `xml:"-" json:"description,omitempty"`
+
+	// Deprecated: In favor of Description - when reading credentials from
+	// storage the value of this field is placed in the Description field above
+	// if the existing Description from storage is empty.
+	Comment string `xml:"-" json:"comment,omitempty"`
 }
 
 func (cred Credentials) String() string {
@@ -136,7 +149,8 @@ func (cred Credentials) IsTemp() bool {
 
 // IsServiceAccount - returns whether credential is a service account or not
 func (cred Credentials) IsServiceAccount() bool {
-	return cred.ParentUser != "" && (cred.Expiration.IsZero() || cred.Expiration.Equal(timeSentinel))
+	_, ok := cred.Claims[iamPolicyClaimNameSA]
+	return cred.ParentUser != "" && ok
 }
 
 // IsValid - returns whether credential is valid or not.

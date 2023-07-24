@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2022 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -24,15 +24,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
-	"runtime"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/v7/pkg/set"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/rest"
+	"github.com/minio/mux"
 	"github.com/minio/pkg/env"
 )
 
@@ -53,23 +53,22 @@ type bootstrapRESTServer struct{}
 
 // ServerSystemConfig - captures information about server configuration.
 type ServerSystemConfig struct {
-	MinioPlatform  string
 	MinioEndpoints EndpointServerPools
 	MinioEnv       map[string]string
 }
 
 // Diff - returns error on first difference found in two configs.
 func (s1 ServerSystemConfig) Diff(s2 ServerSystemConfig) error {
-	if s1.MinioPlatform != s2.MinioPlatform {
-		return fmt.Errorf("Expected platform '%s', found to be running '%s'",
-			s1.MinioPlatform, s2.MinioPlatform)
-	}
 	if s1.MinioEndpoints.NEndpoints() != s2.MinioEndpoints.NEndpoints() {
 		return fmt.Errorf("Expected number of endpoints %d, seen %d", s1.MinioEndpoints.NEndpoints(),
 			s2.MinioEndpoints.NEndpoints())
 	}
 
 	for i, ep := range s1.MinioEndpoints {
+		if ep.CmdLine != s2.MinioEndpoints[i].CmdLine {
+			return fmt.Errorf("Expected command line argument %s, seen %s", ep.CmdLine,
+				s2.MinioEndpoints[i].CmdLine)
+		}
 		if ep.SetCount != s2.MinioEndpoints[i].SetCount {
 			return fmt.Errorf("Expected set count %d, seen %d", ep.SetCount,
 				s2.MinioEndpoints[i].SetCount)
@@ -78,11 +77,9 @@ func (s1 ServerSystemConfig) Diff(s2 ServerSystemConfig) error {
 			return fmt.Errorf("Expected drives pet set %d, seen %d", ep.DrivesPerSet,
 				s2.MinioEndpoints[i].DrivesPerSet)
 		}
-		for j, endpoint := range ep.Endpoints {
-			if endpoint.String() != s2.MinioEndpoints[i].Endpoints[j].String() {
-				return fmt.Errorf("Expected endpoint %s, seen %s", endpoint,
-					s2.MinioEndpoints[i].Endpoints[j])
-			}
+		if ep.Platform != s2.MinioEndpoints[i].Platform {
+			return fmt.Errorf("Expected platform '%s', found to be on '%s'",
+				ep.Platform, s2.MinioEndpoints[i].Platform)
 		}
 	}
 	if !reflect.DeepEqual(s1.MinioEnv, s2.MinioEnv) {
@@ -105,10 +102,14 @@ func (s1 ServerSystemConfig) Diff(s2 ServerSystemConfig) error {
 }
 
 var skipEnvs = map[string]struct{}{
-	"MINIO_OPTS":         {},
-	"MINIO_CERT_PASSWD":  {},
-	"MINIO_SERVER_DEBUG": {},
-	"MINIO_DSYNC_TRACE":  {},
+	"MINIO_OPTS":          {},
+	"MINIO_CERT_PASSWD":   {},
+	"MINIO_SERVER_DEBUG":  {},
+	"MINIO_DSYNC_TRACE":   {},
+	"MINIO_ROOT_USER":     {},
+	"MINIO_ROOT_PASSWORD": {},
+	"MINIO_ACCESS_KEY":    {},
+	"MINIO_SECRET_KEY":    {},
 }
 
 func getServerSystemCfg() ServerSystemConfig {
@@ -122,13 +123,17 @@ func getServerSystemCfg() ServerSystemConfig {
 		if _, ok := skipEnvs[envK]; ok {
 			continue
 		}
-		envValues[envK] = env.Get(envK, "")
+		envValues[envK] = logger.HashString(env.Get(envK, ""))
 	}
 	return ServerSystemConfig{
-		MinioPlatform:  fmt.Sprintf("OS: %s | Arch: %s", runtime.GOOS, runtime.GOARCH),
 		MinioEndpoints: globalEndpoints,
 		MinioEnv:       envValues,
 	}
+}
+
+func (b *bootstrapRESTServer) writeErrorResponse(w http.ResponseWriter, err error) {
+	w.WriteHeader(http.StatusForbidden)
+	w.Write([]byte(err.Error()))
 }
 
 // HealthHandler returns success if request is valid
@@ -136,20 +141,30 @@ func (b *bootstrapRESTServer) HealthHandler(w http.ResponseWriter, r *http.Reque
 
 func (b *bootstrapRESTServer) VerifyHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "VerifyHandler")
+
+	if err := storageServerRequestValidate(r); err != nil {
+		b.writeErrorResponse(w, err)
+		return
+	}
+
 	cfg := getServerSystemCfg()
 	logger.LogIf(ctx, json.NewEncoder(w).Encode(&cfg))
 }
 
 // registerBootstrapRESTHandlers - register bootstrap rest router.
 func registerBootstrapRESTHandlers(router *mux.Router) {
+	h := func(f http.HandlerFunc) http.HandlerFunc {
+		return collectInternodeStats(httpTraceHdrs(f))
+	}
+
 	server := &bootstrapRESTServer{}
 	subrouter := router.PathPrefix(bootstrapRESTPrefix).Subrouter()
 
 	subrouter.Methods(http.MethodPost).Path(bootstrapRESTVersionPrefix + bootstrapRESTMethodHealth).HandlerFunc(
-		httpTraceHdrs(server.HealthHandler))
+		h(server.HealthHandler))
 
 	subrouter.Methods(http.MethodPost).Path(bootstrapRESTVersionPrefix + bootstrapRESTMethodVerify).HandlerFunc(
-		httpTraceHdrs(server.VerifyHandler))
+		h(server.VerifyHandler))
 }
 
 // client to talk to bootstrap NEndpoints.
@@ -200,15 +215,19 @@ func verifyServerSystemConfig(ctx context.Context, endpointServerPools EndpointS
 	srcCfg := getServerSystemCfg()
 	clnts := newBootstrapRESTClients(endpointServerPools)
 	var onlineServers int
-	var offlineEndpoints []string
+	var offlineEndpoints []error
+	var incorrectConfigs []error
 	var retries int
 	for onlineServers < len(clnts)/2 {
 		for _, clnt := range clnts {
 			if err := clnt.Verify(ctx, srcCfg); err != nil {
+				bootstrapTrace(fmt.Sprintf("clnt.Verify: %v, endpoint: %v", err, clnt.endpoint))
 				if !isNetworkError(err) {
-					logger.LogIf(ctx, fmt.Errorf("%s has incorrect configuration: %w", clnt.String(), err))
+					logger.LogOnceIf(ctx, fmt.Errorf("%s has incorrect configuration: %w", clnt.String(), err), clnt.String())
+					incorrectConfigs = append(incorrectConfigs, fmt.Errorf("%s has incorrect configuration: %w", clnt.String(), err))
+				} else {
+					offlineEndpoints = append(offlineEndpoints, fmt.Errorf("%s is unreachable: %w", clnt.String(), err))
 				}
-				offlineEndpoints = append(offlineEndpoints, clnt.String())
 				continue
 			}
 			onlineServers++
@@ -221,15 +240,19 @@ func verifyServerSystemConfig(ctx context.Context, endpointServerPools EndpointS
 			// 100% CPU when half the endpoints are offline.
 			time.Sleep(100 * time.Millisecond)
 			retries++
-			// after 5 retries start logging that servers are not reachable yet
-			if retries >= 5 {
-				logger.Info(fmt.Sprintf("Waiting for atleast %d remote servers to be online for bootstrap check", len(clnts)/2))
+			// after 20 retries start logging that servers are not reachable yet
+			if retries >= 20 {
+				logger.Info(fmt.Sprintf("Waiting for atleast %d remote servers with valid configuration to be online", len(clnts)/2))
 				if len(offlineEndpoints) > 0 {
 					logger.Info(fmt.Sprintf("Following servers are currently offline or unreachable %s", offlineEndpoints))
+				}
+				if len(incorrectConfigs) > 0 {
+					logger.Info(fmt.Sprintf("Following servers have mismatching configuration %s", incorrectConfigs))
 				}
 				retries = 0 // reset to log again after 5 retries.
 			}
 			offlineEndpoints = nil
+			incorrectConfigs = nil
 		}
 	}
 	return nil
@@ -247,7 +270,11 @@ func newBootstrapRESTClients(endpointServerPools EndpointServerPools) []*bootstr
 
 			// Only proceed for remote endpoints.
 			if !endpoint.IsLocal {
-				clnts = append(clnts, newBootstrapRESTClient(endpoint))
+				cl := newBootstrapRESTClient(endpoint)
+				if serverDebugLog {
+					cl.restClient.TraceOutput = os.Stdout
+				}
+				clnts = append(clnts, cl)
 			}
 		}
 	}

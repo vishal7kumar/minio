@@ -30,6 +30,8 @@ import (
 
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/logger"
+	xxml "github.com/minio/xxml"
 )
 
 // Returns a hexadecimal representation of time at the
@@ -63,11 +65,31 @@ func setCommonHeaders(w http.ResponseWriter) {
 
 // Encodes the response headers into XML format.
 func encodeResponse(response interface{}) []byte {
-	var bytesBuffer bytes.Buffer
-	bytesBuffer.WriteString(xml.Header)
-	e := xml.NewEncoder(&bytesBuffer)
-	e.Encode(response)
-	return bytesBuffer.Bytes()
+	var buf bytes.Buffer
+	buf.WriteString(xml.Header)
+	if err := xml.NewEncoder(&buf).Encode(response); err != nil {
+		logger.LogIf(GlobalContext, err)
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// Use this encodeResponseList() to support control characters
+// this function must be used by only ListObjects() for objects
+// with control characters, this is a specialized extension
+// to support AWS S3 compatible behavior.
+//
+// Do not use this function for anything other than ListObjects()
+// variants, please open a github discussion if you wish to use
+// this in other places.
+func encodeResponseList(response interface{}) []byte {
+	var buf bytes.Buffer
+	buf.WriteString(xxml.Header)
+	if err := xxml.NewEncoder(&buf).Encode(response); err != nil {
+		logger.LogIf(GlobalContext, err)
+		return nil
+	}
+	return buf.Bytes()
 }
 
 // Encodes the response headers into JSON format.
@@ -131,7 +153,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 			continue
 		}
 
-		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 			// Do not need to send any internal metadata
 			// values to client.
 			continue
@@ -144,7 +166,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 
 		var isSet bool
 		for _, userMetadataPrefix := range userMetadataKeyPrefixes {
-			if !strings.HasPrefix(strings.ToLower(k), strings.ToLower(userMetadataPrefix)) {
+			if !stringsHasPrefixFold(k, userMetadataPrefix) {
 				continue
 			}
 			w.Header()[strings.ToLower(k)] = []string{v}
@@ -181,7 +203,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 	}
 
 	// Set the relevant version ID as part of the response header.
-	if objInfo.VersionID != "" {
+	if objInfo.VersionID != "" && objInfo.VersionID != nullVersionID {
 		w.Header()[xhttp.AmzVersionID] = []string{objInfo.VersionID}
 	}
 
@@ -197,6 +219,13 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 
 	if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil {
 		lc.SetPredictionHeaders(w, objInfo.ToLifecycleOpts())
+	}
+
+	if v, ok := objInfo.UserDefined[ReservedMetadataPrefix+"compression"]; ok {
+		if i := strings.LastIndexByte(v, '/'); i >= 0 {
+			v = v[i+1:]
+		}
+		w.Header()[xhttp.MinIOCompressed] = []string{v}
 	}
 
 	return nil

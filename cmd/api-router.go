@@ -22,11 +22,11 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/gorilla/mux"
 	"github.com/klauspost/compress/gzhttp"
 	"github.com/minio/console/restapi"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/mux"
 	"github.com/minio/pkg/wildcard"
 	"github.com/rs/cors"
 )
@@ -245,10 +245,10 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodPut).Path("/{object:.+}").
 			HeadersRegexp(xhttp.AmzCopySource, ".*?(\\/|%2F).*?").
 			HandlerFunc(collectAPIStats("copyobjectpart", maxClients(gz(httpTraceAll(api.CopyObjectPartHandler))))).
-			Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId:.*}")
+			Queries("partNumber", "{partNumber:.*}", "uploadId", "{uploadId:.*}")
 		// PutObjectPart
 		router.Methods(http.MethodPut).Path("/{object:.+}").HandlerFunc(
-			collectAPIStats("putobjectpart", maxClients(gz(httpTraceHdrs(api.PutObjectPartHandler))))).Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId:.*}")
+			collectAPIStats("putobjectpart", maxClients(gz(httpTraceHdrs(api.PutObjectPartHandler))))).Queries("partNumber", "{partNumber:.*}", "uploadId", "{uploadId:.*}")
 		// ListObjectParts
 		router.Methods(http.MethodGet).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("listobjectparts", maxClients(gz(httpTraceAll(api.ListObjectPartsHandler))))).Queries("uploadId", "{uploadId:.*}")
@@ -285,7 +285,10 @@ func registerAPIRouter(router *mux.Router) {
 		// GetObjectLegalHold
 		router.Methods(http.MethodGet).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("getobjectlegalhold", maxClients(gz(httpTraceAll(api.GetObjectLegalHoldHandler))))).Queries("legal-hold", "")
-		// GetObject - note gzip compression is *not* added due to Range requests.
+		// GetObject with lambda ARNs
+		router.Methods(http.MethodGet).Path("/{object:.+}").HandlerFunc(
+			collectAPIStats("getobject", maxClients(gz(httpTraceHdrs(api.GetObjectLambdaHandler))))).Queries("lambdaArn", "{lambdaArn:.*}")
+		// GetObject
 		router.Methods(http.MethodGet).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("getobject", maxClients(gz(httpTraceHdrs(api.GetObjectHandler)))))
 		// CopyObject
@@ -342,7 +345,7 @@ func registerAPIRouter(router *mux.Router) {
 			collectAPIStats("getbucketnotification", maxClients(gz(httpTraceAll(api.GetBucketNotificationHandler))))).Queries("notification", "")
 		// ListenNotification
 		router.Methods(http.MethodGet).HandlerFunc(
-			collectAPIStats("listennotification", maxClients(gz(httpTraceAll(api.ListenNotificationHandler))))).Queries("events", "{events:.*}")
+			collectAPIStats("listennotification", gz(httpTraceAll(api.ListenNotificationHandler)))).Queries("events", "{events:.*}")
 		// ResetBucketReplicationStatus - MinIO extension API
 		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("resetbucketreplicationstatus", maxClients(gz(httpTraceAll(api.ResetBucketReplicationStatusHandler))))).Queries("replication-reset-status", "")
@@ -390,6 +393,9 @@ func registerAPIRouter(router *mux.Router) {
 			collectAPIStats("listobjectsv2", maxClients(gz(httpTraceAll(api.ListObjectsV2Handler))))).Queries("list-type", "2")
 		// ListObjectVersions
 		router.Methods(http.MethodGet).HandlerFunc(
+			collectAPIStats("listobjectversions", maxClients(gz(httpTraceAll(api.ListObjectVersionsMHandler))))).Queries("versions", "", "metadata", "true")
+		// ListObjectVersions
+		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("listobjectversions", maxClients(gz(httpTraceAll(api.ListObjectVersionsHandler))))).Queries("versions", "")
 		// GetBucketPolicyStatus
 		router.Methods(http.MethodGet).HandlerFunc(
@@ -431,8 +437,9 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodHead).HandlerFunc(
 			collectAPIStats("headbucket", maxClients(gz(httpTraceAll(api.HeadBucketHandler)))))
 		// PostPolicy
-		router.Methods(http.MethodPost).HeadersRegexp(xhttp.ContentType, "multipart/form-data*").HandlerFunc(
-			collectAPIStats("postpolicybucket", maxClients(gz(httpTraceHdrs(api.PostPolicyBucketHandler)))))
+		router.Methods(http.MethodPost).MatcherFunc(func(r *http.Request, _ *mux.RouteMatch) bool {
+			return isRequestPostPolicySignatureV4(r)
+		}).HandlerFunc(collectAPIStats("postpolicybucket", maxClients(gz(httpTraceHdrs(api.PostPolicyBucketHandler)))))
 		// DeleteMultipleObjects
 		router.Methods(http.MethodPost).HandlerFunc(
 			collectAPIStats("deletemultipleobjects", maxClients(gz(httpTraceAll(api.DeleteMultipleObjectsHandler))))).Queries("delete", "")
@@ -457,6 +464,9 @@ func registerAPIRouter(router *mux.Router) {
 		// GetBucketReplicationMetrics
 		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("getbucketreplicationmetrics", maxClients(gz(httpTraceAll(api.GetBucketReplicationMetricsHandler))))).Queries("replication-metrics", "")
+		// ValidateBucketReplicationCreds
+		router.Methods(http.MethodGet).HandlerFunc(
+			collectAPIStats("checkbucketreplicationconfiguration", maxClients(gz(httpTraceAll(api.ValidateBucketReplicationCredsHandler))))).Queries("replication-check", "")
 
 		// Register rejected bucket APIs
 		for _, r := range rejectedBucketAPIs {
@@ -474,7 +484,7 @@ func registerAPIRouter(router *mux.Router) {
 
 	// ListenNotification
 	apiRouter.Methods(http.MethodGet).Path(SlashSeparator).HandlerFunc(
-		collectAPIStats("listennotification", maxClients(gz(httpTraceAll(api.ListenNotificationHandler))))).Queries("events", "{events:.*}")
+		collectAPIStats("listennotification", gz(httpTraceAll(api.ListenNotificationHandler)))).Queries("events", "{events:.*}")
 
 	// ListBuckets
 	apiRouter.Methods(http.MethodGet).Path(SlashSeparator).HandlerFunc(
@@ -513,8 +523,7 @@ func corsHandler(handler http.Handler) http.Handler {
 		"x-amz*",
 		"*",
 	}
-
-	return cors.New(cors.Options{
+	opts := cors.Options{
 		AllowOriginFunc: func(origin string) bool {
 			for _, allowedOrigin := range globalAPIConfig.getCorsAllowOrigins() {
 				if wildcard.MatchSimple(allowedOrigin, origin) {
@@ -535,5 +544,13 @@ func corsHandler(handler http.Handler) http.Handler {
 		AllowedHeaders:   commonS3Headers,
 		ExposedHeaders:   commonS3Headers,
 		AllowCredentials: true,
-	}).Handler(handler)
+	}
+	for _, origin := range globalAPIConfig.getCorsAllowOrigins() {
+		if origin == "*" {
+			opts.AllowOriginFunc = nil
+			opts.AllowedOrigins = globalAPIConfig.getCorsAllowOrigins()
+			break
+		}
+	}
+	return cors.New(opts).Handler(handler)
 }

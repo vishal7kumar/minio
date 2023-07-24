@@ -9,11 +9,11 @@ This guide explains how to configure MinIO Server with TLS certificates on Linux
 
 ## 1. Install MinIO Server
 
-Install MinIO Server using the instructions in the [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide).
+Install MinIO Server using the instructions in the [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#quickstart-for-linux).
 
 ## 2. Use an Existing Key and Certificate with MinIO
 
-This section describes how to use a private key and public certificate that have been obtained from a certificate authority (CA). If these files have not been obtained, skip to [3. Generate Self-signed Certificates](#generate-use-self-signed-keys-certificates) or generate them with [Let's Encrypt](https://letsencrypt.org) using these instructions: [Generate Let's Encrypt certificate using Certbot for MinIO](https://docs.min.io/docs/generate-let-s-encypt-certificate-using-concert-for-minio.html).
+This section describes how to use a private key and public certificate that have been obtained from a certificate authority (CA). If these files have not been obtained, skip to [3. Generate Self-signed Certificates](#generate-use-self-signed-keys-certificates) or generate them with [Let's Encrypt](https://letsencrypt.org) using these instructions: [Generate Let's Encrypt certificate using Certbot for MinIO](https://min.io/docs/minio/linux/integrations/generate-lets-encrypt-certificate-using-certbot-for-minio.html). For more about TLS and certificates in MinIO, see the [Network Encryption documentation](https://min.io/docs/minio/kubernetes/upstream/operations/network-encryption.html).
 
 Copy the existing private key and public certificate to the `certs` directory. The default certs directory is:
 
@@ -47,7 +47,7 @@ Download [`certgen`](https://github.com/minio/certgen/releases/latest) for your 
 `certgen` is a simple *Go* tool to generate self-signed certificates, and provides SAN certificates with DNS and IP entries:
 
 ```sh
-./certgen -ca -host "10.10.0.3,10.10.0.4,10.10.0.5"
+./certgen -host "10.10.0.3,10.10.0.4,10.10.0.5"
 ```
 
 A response similar to this one should be displayed:
@@ -85,8 +85,6 @@ Alternatively, use the following command to generate a private ECDSA key protect
 ```sh
 openssl ecparam -genkey -name prime256v1 | openssl ec -aes256 -out private.key -passout pass:PASSWORD
 ```
-
-**Note:** NIST curves P-384 and P-521 are not currently supported.
 
 #### 3.2.2 Generate a private key with RSA
 
@@ -240,6 +238,7 @@ MinIO can connect to other servers, including MinIO nodes or other server types 
 ## Explore Further
 
 * [TLS Configuration for MinIO server on Kubernetes](https://github.com/minio/minio/tree/master/docs/tls/kubernetes)
-* [MinIO Client Complete Guide](https://docs.min.io/docs/minio-client-complete-guide)
-* [Generate Let's Encrypt Certificate](https://docs.min.io/docs/generate-let-s-encypt-certificate-using-concert-for-minio)
-* [Setup nginx Proxy with MinIO Server](https://docs.min.io/docs/setup-nginx-proxy-with-minio)
+* [MinIO Client Complete Guide](https://min.io/docs/minio/linux/reference/minio-mc.html)
+* [MinIO Network Encryption Overview](https://min.io/docs/minio/linux/operations/network-encryption.html)
+* [Generate Let's Encrypt Certificate](https://min.io/docs/minio/linux/integrations/generate-lets-encrypt-certificate-using-certbot-for-minio.html)
+* [Setup nginx Proxy with MinIO Server](https://min.io/docs/minio/linux/integrations/setup-nginx-proxy-with-minio.html)

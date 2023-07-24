@@ -18,8 +18,8 @@
 package cmd
 
 import (
-	"io/ioutil"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -30,6 +30,7 @@ import (
 	"github.com/minio/minio/internal/config/api"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/mcontext"
 )
 
 type apiConfig struct {
@@ -41,22 +42,23 @@ type apiConfig struct {
 	listQuorum       string
 	corsAllowOrigins []string
 	// total drives per erasure set across pools.
-	totalDriveCount          int
-	replicationWorkers       int
-	replicationFailedWorkers int
-	transitionWorkers        int
+	totalDriveCount     int
+	replicationPriority string
+	transitionWorkers   int
 
 	staleUploadsExpiry          time.Duration
 	staleUploadsCleanupInterval time.Duration
 	deleteCleanupInterval       time.Duration
 	disableODirect              bool
 	gzipObjects                 bool
+	rootAccess                  bool
+	syncEvents                  bool
 }
 
 const cgroupLimitFile = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 
 func cgroupLimit(limitFile string) (limit uint64) {
-	buf, err := ioutil.ReadFile(limitFile)
+	buf, err := os.ReadFile(limitFile)
 	if err != nil {
 		return 9223372036854771712
 	}
@@ -96,8 +98,17 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.clusterDeadline = cfg.ClusterDeadline
-	t.corsAllowOrigins = cfg.CorsAllowOrigin
+	clusterDeadline := cfg.ClusterDeadline
+	if clusterDeadline == 0 {
+		clusterDeadline = 10 * time.Second
+	}
+	t.clusterDeadline = clusterDeadline
+	corsAllowOrigin := cfg.CorsAllowOrigin
+	if len(corsAllowOrigin) == 0 {
+		corsAllowOrigin = []string{"*"}
+	}
+	t.corsAllowOrigins = corsAllowOrigin
+
 	maxSetDrives := 0
 	for _, setDriveCount := range setDriveCounts {
 		t.totalDriveCount += setDriveCount
@@ -116,8 +127,7 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 		//    + 2 * 10MiB (default erasure block size v1) + 2 * 1MiB (default erasure block size v2)
 		blockSize := xioutil.BlockSizeLarge + xioutil.BlockSizeSmall
 		apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV1*2+blockSizeV2*2)))
-
-		if globalIsErasure {
+		if globalIsDistErasure {
 			logger.Info("Automatically configured API requests per node based on available memory on the system: %d", apiRequestsMaxPerNode)
 		}
 	} else {
@@ -136,14 +146,16 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 		t.requestsPool = make(chan struct{}, apiRequestsMaxPerNode)
 	}
 	t.requestsDeadline = cfg.RequestsDeadline
-	t.listQuorum = cfg.ListQuorum
-	if globalReplicationPool != nil &&
-		cfg.ReplicationWorkers != t.replicationWorkers {
-		globalReplicationPool.ResizeFailedWorkers(cfg.ReplicationFailedWorkers)
-		globalReplicationPool.ResizeWorkers(cfg.ReplicationWorkers)
+	listQuorum := cfg.ListQuorum
+	if listQuorum == "" {
+		listQuorum = "strict"
 	}
-	t.replicationFailedWorkers = cfg.ReplicationFailedWorkers
-	t.replicationWorkers = cfg.ReplicationWorkers
+	t.listQuorum = listQuorum
+	if globalReplicationPool != nil &&
+		cfg.ReplicationPriority != t.replicationPriority {
+		globalReplicationPool.ResizeWorkerPriority(cfg.ReplicationPriority)
+	}
+	t.replicationPriority = cfg.ReplicationPriority
 	if globalTransitionState != nil && cfg.TransitionWorkers != t.transitionWorkers {
 		globalTransitionState.UpdateWorkers(cfg.TransitionWorkers)
 	}
@@ -154,6 +166,8 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 	t.deleteCleanupInterval = cfg.DeleteCleanupInterval
 	t.disableODirect = cfg.DisableODirect
 	t.gzipObjects = cfg.GzipObjects
+	t.rootAccess = cfg.RootAccess
+	t.syncEvents = cfg.SyncEvents
 }
 
 func (t *apiConfig) isDisableODirect() bool {
@@ -170,9 +184,20 @@ func (t *apiConfig) shouldGzipObjects() bool {
 	return t.gzipObjects
 }
 
+func (t *apiConfig) permitRootAccess() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.rootAccess
+}
+
 func (t *apiConfig) getListQuorum() string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+
+	if t.listQuorum == "" {
+		return "strict"
+	}
 
 	return t.listQuorum
 }
@@ -180,6 +205,10 @@ func (t *apiConfig) getListQuorum() string {
 func (t *apiConfig) getCorsAllowOrigins() []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+
+	if len(t.corsAllowOrigins) == 0 {
+		return []string{"*"}
+	}
 
 	corsAllowOrigins := make([]string, len(t.corsAllowOrigins))
 	copy(corsAllowOrigins, t.corsAllowOrigins)
@@ -230,6 +259,13 @@ func (t *apiConfig) getClusterDeadline() time.Duration {
 	return t.clusterDeadline
 }
 
+func (t *apiConfig) getRequestsPoolCapacity() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return cap(t.requestsPool)
+}
+
 func (t *apiConfig) getRequestsPool() (chan struct{}, time.Duration) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -246,10 +282,17 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		globalHTTPStats.incS3RequestsIncoming()
 
-		if val := globalServiceFreeze.Load(); val != nil {
-			if unlock, ok := val.(chan struct{}); ok && unlock != nil {
-				// Wait until unfrozen.
-				<-unlock
+		if r.Header.Get(globalObjectPerfUserMetadata) == "" {
+			if val := globalServiceFreeze.Load(); val != nil {
+				if unlock, ok := val.(chan struct{}); ok && unlock != nil {
+					// Wait until unfrozen.
+					select {
+					case <-unlock:
+					case <-r.Context().Done():
+						// if client canceled we don't need to wait here forever.
+						return
+					}
+				}
 			}
 		}
 
@@ -260,6 +303,10 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 		}
 
 		globalHTTPStats.addRequestsInQueue(1)
+
+		if tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt); ok {
+			tc.FuncName = "s3.MaxClients"
+		}
 
 		deadlineTimer := time.NewTimer(deadline)
 		defer deadlineTimer.Stop()
@@ -272,34 +319,46 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 		case <-deadlineTimer.C:
 			// Send a http timeout message
 			writeErrorResponse(r.Context(), w,
-				errorCodes.ToAPIErr(ErrOperationMaxedOut),
+				errorCodes.ToAPIErr(ErrTooManyRequests),
 				r.URL)
 			globalHTTPStats.addRequestsInQueue(-1)
 			return
 		case <-r.Context().Done():
+			// When the client disconnects before getting the S3 handler
+			// status code response, set the status code to 499 so this request
+			// will be properly audited and traced.
+			w.WriteHeader(499)
 			globalHTTPStats.addRequestsInQueue(-1)
 			return
 		}
 	}
 }
 
-func (t *apiConfig) getReplicationFailedWorkers() int {
+func (t *apiConfig) getReplicationPriority() string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	return t.replicationFailedWorkers
-}
+	if t.replicationPriority == "" {
+		return "auto"
+	}
 
-func (t *apiConfig) getReplicationWorkers() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	return t.replicationWorkers
+	return t.replicationPriority
 }
 
 func (t *apiConfig) getTransitionWorkers() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	if t.transitionWorkers <= 0 {
+		return runtime.GOMAXPROCS(0) / 2
+	}
+
 	return t.transitionWorkers
+}
+
+func (t *apiConfig) isSyncEventsEnabled() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.syncEvents
 }

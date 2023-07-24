@@ -22,13 +22,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
-	"errors"
 	"fmt"
+	"net/http"
 	"path"
 	"strings"
 	"sync"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/kms"
@@ -37,16 +37,36 @@ import (
 //go:generate msgp -file $GOFILE
 
 var (
-	errTierInsufficientCreds = errors.New("insufficient tier credentials supplied")
-	errTierBackendInUse      = errors.New("remote tier backend already in use")
-	errTierTypeUnsupported   = errors.New("unsupported tier type")
-	errTierBackendNotEmpty   = errors.New("remote tier not empty")
+	errTierMissingCredentials = AdminError{
+		Code:       "XMinioAdminTierMissingCredentials",
+		Message:    "Specified remote credentials are empty",
+		StatusCode: http.StatusForbidden,
+	}
+
+	errTierBackendInUse = AdminError{
+		Code:       "XMinioAdminTierBackendInUse",
+		Message:    "Specified remote tier is already in use",
+		StatusCode: http.StatusConflict,
+	}
+
+	errTierTypeUnsupported = AdminError{
+		Code:       "XMinioAdminTierTypeUnsupported",
+		Message:    "Specified tier type is unsupported",
+		StatusCode: http.StatusBadRequest,
+	}
+
+	errTierBackendNotEmpty = AdminError{
+		Code:       "XMinioAdminTierBackendNotEmpty",
+		Message:    "Specified remote backend is not empty",
+		StatusCode: http.StatusBadRequest,
+	}
 )
 
 const (
 	tierConfigFile    = "tier-config.bin"
 	tierConfigFormat  = 1
-	tierConfigVersion = 1
+	tierConfigV1      = 1
+	tierConfigVersion = 2
 
 	minioHotTier = "STANDARD"
 )
@@ -83,7 +103,7 @@ func (config *TierConfigMgr) isTierNameInUse(tierName string) (madmin.TierType, 
 }
 
 // Add adds tier to config if it passes all validations.
-func (config *TierConfigMgr) Add(ctx context.Context, tier madmin.TierConfig) error {
+func (config *TierConfigMgr) Add(ctx context.Context, tier madmin.TierConfig, ignoreInUse bool) error {
 	config.Lock()
 	defer config.Unlock()
 
@@ -102,13 +122,16 @@ func (config *TierConfigMgr) Add(ctx context.Context, tier madmin.TierConfig) er
 	if err != nil {
 		return err
 	}
-	// Check if warmbackend is in use by other MinIO tenants
-	inUse, err := d.InUse(ctx)
-	if err != nil {
-		return err
-	}
-	if inUse {
-		return errTierBackendInUse
+
+	if !ignoreInUse {
+		// Check if warmbackend is in use by other MinIO tenants
+		inUse, err := d.InUse(ctx)
+		if err != nil {
+			return err
+		}
+		if inUse {
+			return errTierBackendInUse
+		}
 	}
 
 	config.Tiers[tierName] = tier
@@ -184,7 +207,7 @@ func (config *TierConfigMgr) Edit(ctx context.Context, tierName string, creds ma
 	switch tierType {
 	case madmin.S3:
 		if (creds.AccessKey == "" || creds.SecretKey == "") && !creds.AWSRole {
-			return errTierInsufficientCreds
+			return errTierMissingCredentials
 		}
 		switch {
 		case creds.AWSRole:
@@ -195,15 +218,21 @@ func (config *TierConfigMgr) Edit(ctx context.Context, tierName string, creds ma
 		}
 	case madmin.Azure:
 		if creds.SecretKey == "" {
-			return errTierInsufficientCreds
+			return errTierMissingCredentials
 		}
 		cfg.Azure.AccountKey = creds.SecretKey
 
 	case madmin.GCS:
 		if creds.CredsJSON == nil {
-			return errTierInsufficientCreds
+			return errTierMissingCredentials
 		}
 		cfg.GCS.Creds = base64.URLEncoding.EncodeToString(creds.CredsJSON)
+	case madmin.MinIO:
+		if creds.AccessKey == "" || creds.SecretKey == "" {
+			return errTierMissingCredentials
+		}
+		cfg.MinIO.AccessKey = creds.AccessKey
+		cfg.MinIO.SecretKey = creds.SecretKey
 	}
 
 	d, err := newWarmBackend(ctx, cfg)
@@ -280,7 +309,7 @@ func (config *TierConfigMgr) configReader() (*PutObjReader, *ObjectOptions, erro
 
 	// Encrypt json encoded tier configurations
 	metadata := make(map[string]string)
-	encBr, oek, err := newEncryptReader(hr, crypto.S3, "", nil, minioMetaBucket, tierConfigPath, metadata, kms.Context{})
+	encBr, oek, err := newEncryptReader(context.Background(), hr, crypto.S3, "", nil, minioMetaBucket, tierConfigPath, metadata, kms.Context{})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -375,22 +404,22 @@ func loadTierConfig(ctx context.Context, objAPI ObjectLayer) (*TierConfigMgr, er
 	}
 
 	// Read header
-	switch binary.LittleEndian.Uint16(data[0:2]) {
+	switch format := binary.LittleEndian.Uint16(data[0:2]); format {
 	case tierConfigFormat:
 	default:
-		return nil, fmt.Errorf("tierConfigInit: unknown format: %d", binary.LittleEndian.Uint16(data[0:2]))
-	}
-	switch binary.LittleEndian.Uint16(data[2:4]) {
-	case tierConfigVersion:
-	default:
-		return nil, fmt.Errorf("tierConfigInit: unknown version: %d", binary.LittleEndian.Uint16(data[2:4]))
+		return nil, fmt.Errorf("tierConfigInit: unknown format: %d", format)
 	}
 
 	cfg := NewTierConfigMgr()
-	_, decErr := cfg.UnmarshalMsg(data[4:])
-	if decErr != nil {
-		return nil, decErr
+	switch version := binary.LittleEndian.Uint16(data[2:4]); version {
+	case tierConfigV1, tierConfigVersion:
+		if _, decErr := cfg.UnmarshalMsg(data[4:]); decErr != nil {
+			return nil, decErr
+		}
+	default:
+		return nil, fmt.Errorf("tierConfigInit: unknown version: %d", version)
 	}
+
 	return cfg, nil
 }
 
@@ -408,10 +437,5 @@ func (config *TierConfigMgr) Reset() {
 
 // Init initializes tier configuration reading from objAPI
 func (config *TierConfigMgr) Init(ctx context.Context, objAPI ObjectLayer) error {
-	// In gateway mode, we don't support ILM tier configuration.
-	if globalIsGateway {
-		return nil
-	}
-
 	return config.Reload(ctx, objAPI)
 }

@@ -19,14 +19,14 @@ package dsync
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/mux"
+	"github.com/minio/mux"
 )
 
 const numberOfNodes = 5
@@ -38,7 +38,7 @@ var (
 )
 
 func getLockArgs(r *http.Request) (args LockArgs, err error) {
-	buf, err := ioutil.ReadAll(r.Body)
+	buf, err := io.ReadAll(r.Body)
 	if err != nil {
 		return args, err
 	}

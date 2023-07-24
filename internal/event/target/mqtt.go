@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,7 +18,6 @@
 package target
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -31,11 +30,14 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
+	"github.com/minio/minio/internal/store"
 	xnet "github.com/minio/pkg/net"
 )
 
 const (
-	reconnectInterval = 5 // In Seconds
+	reconnectInterval = 5 * time.Second
 	storePrefix       = "minio"
 )
 
@@ -106,12 +108,14 @@ func (m MQTTArgs) Validate() error {
 
 // MQTTTarget - MQTT target.
 type MQTTTarget struct {
+	initOnce once.Init
+
 	id         event.TargetID
 	args       MQTTArgs
 	client     mqtt.Client
-	store      Store
+	store      store.Store[event.Event]
 	quitCh     chan struct{}
-	loggerOnce func(ctx context.Context, err error, id interface{}, kind ...interface{})
+	loggerOnce logger.LogOnce
 }
 
 // ID - returns target ID.
@@ -119,15 +123,27 @@ func (target *MQTTTarget) ID() event.TargetID {
 	return target.id
 }
 
-// HasQueueStore - Checks if the queueStore has been configured for the target
-func (target *MQTTTarget) HasQueueStore() bool {
-	return target.store != nil
+// Name - returns the Name of the target.
+func (target *MQTTTarget) Name() string {
+	return target.ID().String()
+}
+
+// Store returns any underlying store if set.
+func (target *MQTTTarget) Store() event.TargetStore {
+	return target.store
 }
 
 // IsActive - Return true if target is up and active
 func (target *MQTTTarget) IsActive() (bool, error) {
+	if err := target.init(); err != nil {
+		return false, err
+	}
+	return target.isActive()
+}
+
+func (target *MQTTTarget) isActive() (bool, error) {
 	if !target.client.IsConnectionOpen() {
-		return false, errNotConnected
+		return false, store.ErrNotConnected
 	}
 	return true, nil
 }
@@ -146,16 +162,20 @@ func (target *MQTTTarget) send(eventData event.Event) error {
 	}
 
 	token := target.client.Publish(target.args.Topic, target.args.QoS, false, string(data))
-	if !token.WaitTimeout(reconnectInterval * time.Second) {
-		return errNotConnected
+	if !token.WaitTimeout(reconnectInterval) {
+		return store.ErrNotConnected
 	}
 	return token.Error()
 }
 
-// Send - reads an event from store and sends it to MQTT.
-func (target *MQTTTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to MQTT.
+func (target *MQTTTarget) SendFromStore(eventKey string) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
 	// Do not send if the connection is not active.
-	_, err := target.IsActive()
+	_, err := target.isActive()
 	if err != nil {
 		return err
 	}
@@ -184,9 +204,12 @@ func (target *MQTTTarget) Save(eventData event.Event) error {
 	if target.store != nil {
 		return target.store.Put(eventData)
 	}
+	if err := target.init(); err != nil {
+		return err
+	}
 
 	// Do not send if the connection is not active.
-	_, err := target.IsActive()
+	_, err := target.isActive()
 	if err != nil {
 		return err
 	}
@@ -201,17 +224,12 @@ func (target *MQTTTarget) Close() error {
 	return nil
 }
 
-// NewMQTTTarget - creates new MQTT target.
-func NewMQTTTarget(id string, args MQTTArgs, doneCh <-chan struct{}, loggerOnce func(ctx context.Context, err error, id interface{}, kind ...interface{}), test bool) (*MQTTTarget, error) {
-	if args.MaxReconnectInterval == 0 {
-		// Default interval
-		// https://github.com/eclipse/paho.mqtt.golang/blob/master/options.go#L115
-		args.MaxReconnectInterval = 10 * time.Minute
-	}
+func (target *MQTTTarget) init() error {
+	return target.initOnce.Do(target.initMQTT)
+}
 
-	if args.KeepAlive == 0 {
-		args.KeepAlive = 10 * time.Second
-	}
+func (target *MQTTTarget) initMQTT() error {
+	args := target.args
 
 	// Using hex here, to make sure we avoid 23
 	// character limit on client_id according to
@@ -228,61 +246,60 @@ func NewMQTTTarget(id string, args MQTTArgs, doneCh <-chan struct{}, loggerOnce 
 		SetTLSConfig(&tls.Config{RootCAs: args.RootCAs}).
 		AddBroker(args.Broker.String())
 
-	client := mqtt.NewClient(options)
+	target.client = mqtt.NewClient(options)
+
+	token := target.client.Connect()
+	ok := token.WaitTimeout(reconnectInterval)
+	if !ok {
+		return store.ErrNotConnected
+	}
+	if token.Error() != nil {
+		return token.Error()
+	}
+
+	yes, err := target.isActive()
+	if err != nil {
+		return err
+	}
+	if !yes {
+		return store.ErrNotConnected
+	}
+
+	return nil
+}
+
+// NewMQTTTarget - creates new MQTT target.
+func NewMQTTTarget(id string, args MQTTArgs, loggerOnce logger.LogOnce) (*MQTTTarget, error) {
+	if args.MaxReconnectInterval == 0 {
+		// Default interval
+		// https://github.com/eclipse/paho.mqtt.golang/blob/master/options.go#L115
+		args.MaxReconnectInterval = 10 * time.Minute
+	}
+
+	if args.KeepAlive == 0 {
+		args.KeepAlive = 10 * time.Second
+	}
+
+	var queueStore store.Store[event.Event]
+	if args.QueueDir != "" {
+		queueDir := filepath.Join(args.QueueDir, storePrefix+"-mqtt-"+id)
+		queueStore = store.NewQueueStore[event.Event](queueDir, args.QueueLimit, event.StoreExtension)
+		if err := queueStore.Open(); err != nil {
+			return nil, fmt.Errorf("unable to initialize the queue store of MQTT `%s`: %w", id, err)
+		}
+	}
 
 	target := &MQTTTarget{
 		id:         event.TargetID{ID: id, Name: "mqtt"},
 		args:       args,
-		client:     client,
+		store:      queueStore,
 		quitCh:     make(chan struct{}),
 		loggerOnce: loggerOnce,
 	}
 
-	token := client.Connect()
-	retryRegister := func() {
-		for {
-		retry:
-			select {
-			case <-doneCh:
-				return
-			case <-target.quitCh:
-				return
-			default:
-				ok := token.WaitTimeout(reconnectInterval * time.Second)
-				if ok && token.Error() != nil {
-					target.loggerOnce(context.Background(),
-						fmt.Errorf("Previous connect failed with %w attempting a reconnect",
-							token.Error()),
-						target.ID())
-					time.Sleep(reconnectInterval * time.Second)
-					token = client.Connect()
-					goto retry
-				}
-				if ok {
-					// Successfully connected.
-					return
-				}
-			}
-		}
+	if target.store != nil {
+		store.StreamItems(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
-	if args.QueueDir != "" {
-		queueDir := filepath.Join(args.QueueDir, storePrefix+"-mqtt-"+id)
-		target.store = NewQueueStore(queueDir, args.QueueLimit)
-		if err := target.store.Open(); err != nil {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
-		}
-
-		if !test {
-			go retryRegister()
-			// Replays the events from the store.
-			eventKeyCh := replayEvents(target.store, doneCh, target.loggerOnce, target.ID())
-			// Start replaying events from the store.
-			go sendEvents(target, eventKeyCh, doneCh, target.loggerOnce)
-		}
-	} else if token.Wait() && token.Error() != nil {
-		return target, token.Error()
-	}
 	return target, nil
 }

@@ -19,77 +19,261 @@ package cmd
 
 import (
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/minio/minio/internal/logger"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// ConnStats - Network statistics
+// connStats - Network statistics
 // Count total input/output transferred bytes during
 // the server's life.
-type ConnStats struct {
-	totalInputBytes  uint64
-	totalOutputBytes uint64
-	s3InputBytes     uint64
-	s3OutputBytes    uint64
+type connStats struct {
+	internodeInputBytes  uint64
+	internodeOutputBytes uint64
+	s3InputBytes         uint64
+	s3OutputBytes        uint64
 }
 
-// Increase total input bytes
-func (s *ConnStats) incInputBytes(n int64) {
-	atomic.AddUint64(&s.totalInputBytes, uint64(n))
+// Increase internode total input bytes
+func (s *connStats) incInternodeInputBytes(n int64) {
+	atomic.AddUint64(&s.internodeInputBytes, uint64(n))
 }
 
-// Increase total output bytes
-func (s *ConnStats) incOutputBytes(n int64) {
-	atomic.AddUint64(&s.totalOutputBytes, uint64(n))
+// Increase internode total output bytes
+func (s *connStats) incInternodeOutputBytes(n int64) {
+	atomic.AddUint64(&s.internodeOutputBytes, uint64(n))
 }
 
-// Return total input bytes
-func (s *ConnStats) getTotalInputBytes() uint64 {
-	return atomic.LoadUint64(&s.totalInputBytes)
+// Return internode total input bytes
+func (s *connStats) getInternodeInputBytes() uint64 {
+	return atomic.LoadUint64(&s.internodeInputBytes)
 }
 
 // Return total output bytes
-func (s *ConnStats) getTotalOutputBytes() uint64 {
-	return atomic.LoadUint64(&s.totalOutputBytes)
+func (s *connStats) getInternodeOutputBytes() uint64 {
+	return atomic.LoadUint64(&s.internodeOutputBytes)
 }
 
-// Increase outbound input bytes
-func (s *ConnStats) incS3InputBytes(n int64) {
+// Increase S3 total input bytes
+func (s *connStats) incS3InputBytes(n int64) {
 	atomic.AddUint64(&s.s3InputBytes, uint64(n))
 }
 
-// Increase outbound output bytes
-func (s *ConnStats) incS3OutputBytes(n int64) {
+// Increase S3 total output bytes
+func (s *connStats) incS3OutputBytes(n int64) {
 	atomic.AddUint64(&s.s3OutputBytes, uint64(n))
 }
 
-// Return outbound input bytes
-func (s *ConnStats) getS3InputBytes() uint64 {
+// Return S3 total input bytes
+func (s *connStats) getS3InputBytes() uint64 {
 	return atomic.LoadUint64(&s.s3InputBytes)
 }
 
-// Return outbound output bytes
-func (s *ConnStats) getS3OutputBytes() uint64 {
+// Return S3 total output bytes
+func (s *connStats) getS3OutputBytes() uint64 {
 	return atomic.LoadUint64(&s.s3OutputBytes)
 }
 
 // Return connection stats (total input/output bytes and total s3 input/output bytes)
-func (s *ConnStats) toServerConnStats() ServerConnStats {
-	return ServerConnStats{
-		TotalInputBytes:  s.getTotalInputBytes(),  // Traffic including reserved bucket
-		TotalOutputBytes: s.getTotalOutputBytes(), // Traffic including reserved bucket
-		S3InputBytes:     s.getS3InputBytes(),     // Traffic for client buckets
-		S3OutputBytes:    s.getS3OutputBytes(),    // Traffic for client buckets
+func (s *connStats) toServerConnStats() serverConnStats {
+	return serverConnStats{
+		internodeInputBytes:  s.getInternodeInputBytes(),  // Traffic internode received
+		internodeOutputBytes: s.getInternodeOutputBytes(), // Traffic internode sent
+		s3InputBytes:         s.getS3InputBytes(),         // Traffic S3 received
+		s3OutputBytes:        s.getS3OutputBytes(),        // Traffic S3 sent
 	}
 }
 
 // Prepare new ConnStats structure
-func newConnStats() *ConnStats {
-	return &ConnStats{}
+func newConnStats() *connStats {
+	return &connStats{}
+}
+
+type bucketS3RXTX struct {
+	s3InputBytes  uint64
+	s3OutputBytes uint64
+}
+
+type bucketHTTPAPIStats struct {
+	currentS3Requests *HTTPAPIStats
+	totalS3Requests   *HTTPAPIStats
+	totalS34xxErrors  *HTTPAPIStats
+	totalS35xxErrors  *HTTPAPIStats
+	totalS3Canceled   *HTTPAPIStats
+}
+
+type bucketHTTPStats struct {
+	sync.RWMutex
+	httpStats map[string]bucketHTTPAPIStats
+}
+
+func newBucketHTTPStats() *bucketHTTPStats {
+	return &bucketHTTPStats{
+		httpStats: make(map[string]bucketHTTPAPIStats),
+	}
+}
+
+func (bh *bucketHTTPStats) delete(bucket string) {
+	bh.Lock()
+	defer bh.Unlock()
+
+	delete(bh.httpStats, bucket)
+}
+
+func (bh *bucketHTTPStats) updateHTTPStats(bucket, api string, w *xhttp.ResponseRecorder) {
+	if bh == nil {
+		return
+	}
+
+	if w != nil {
+		// Increment the prometheus http request response histogram with API, Bucket
+		bucketHTTPRequestsDuration.With(prometheus.Labels{
+			"api":    api,
+			"bucket": bucket,
+		}).Observe(w.TimeToFirstByte.Seconds())
+	}
+
+	bh.Lock()
+	defer bh.Unlock()
+
+	hstats, ok := bh.httpStats[bucket]
+	if !ok {
+		hstats = bucketHTTPAPIStats{
+			currentS3Requests: &HTTPAPIStats{},
+			totalS3Requests:   &HTTPAPIStats{},
+			totalS3Canceled:   &HTTPAPIStats{},
+			totalS34xxErrors:  &HTTPAPIStats{},
+			totalS35xxErrors:  &HTTPAPIStats{},
+		}
+	}
+
+	if w == nil { // when response recorder nil, this is an active request
+		hstats.currentS3Requests.Inc(api)
+		bh.httpStats[bucket] = hstats
+		return
+	} // else {
+	hstats.currentS3Requests.Dec(api) // decrement this once we have the response recorder.
+
+	hstats.totalS3Requests.Inc(api)
+	code := w.StatusCode
+
+	switch {
+	case code == 0:
+	case code == 499:
+		// 499 is a good error, shall be counted as canceled.
+		hstats.totalS3Canceled.Inc(api)
+	case code >= http.StatusBadRequest:
+		if code >= http.StatusInternalServerError {
+			hstats.totalS35xxErrors.Inc(api)
+		} else {
+			hstats.totalS34xxErrors.Inc(api)
+		}
+	}
+
+	bh.httpStats[bucket] = hstats
+}
+
+func (bh *bucketHTTPStats) load(bucket string) bucketHTTPAPIStats {
+	if bh == nil {
+		return bucketHTTPAPIStats{
+			currentS3Requests: &HTTPAPIStats{},
+			totalS3Requests:   &HTTPAPIStats{},
+			totalS3Canceled:   &HTTPAPIStats{},
+			totalS34xxErrors:  &HTTPAPIStats{},
+			totalS35xxErrors:  &HTTPAPIStats{},
+		}
+	}
+
+	bh.RLock()
+	defer bh.RUnlock()
+
+	val, ok := bh.httpStats[bucket]
+	if ok {
+		return val
+	}
+
+	return bucketHTTPAPIStats{
+		currentS3Requests: &HTTPAPIStats{},
+		totalS3Requests:   &HTTPAPIStats{},
+		totalS3Canceled:   &HTTPAPIStats{},
+		totalS34xxErrors:  &HTTPAPIStats{},
+		totalS35xxErrors:  &HTTPAPIStats{},
+	}
+}
+
+type bucketConnStats struct {
+	sync.RWMutex
+	stats map[string]*bucketS3RXTX
+}
+
+func newBucketConnStats() *bucketConnStats {
+	return &bucketConnStats{
+		stats: make(map[string]*bucketS3RXTX),
+	}
+}
+
+// Increase S3 total input bytes for input bucket
+func (s *bucketConnStats) incS3InputBytes(bucket string, n int64) {
+	s.Lock()
+	defer s.Unlock()
+	stats, ok := s.stats[bucket]
+	if !ok {
+		stats = &bucketS3RXTX{
+			s3InputBytes: uint64(n),
+		}
+	} else {
+		stats.s3InputBytes += uint64(n)
+	}
+	s.stats[bucket] = stats
+}
+
+// Increase S3 total output bytes for input bucket
+func (s *bucketConnStats) incS3OutputBytes(bucket string, n int64) {
+	s.Lock()
+	defer s.Unlock()
+	stats, ok := s.stats[bucket]
+	if !ok {
+		stats = &bucketS3RXTX{
+			s3OutputBytes: uint64(n),
+		}
+	} else {
+		stats.s3OutputBytes += uint64(n)
+	}
+	s.stats[bucket] = stats
+}
+
+type inOutBytes struct {
+	In  uint64
+	Out uint64
+}
+
+// Return S3 total input bytes for input bucket
+func (s *bucketConnStats) getS3InOutBytes() map[string]inOutBytes {
+	s.RLock()
+	defer s.RUnlock()
+
+	if len(s.stats) == 0 {
+		return nil
+	}
+
+	bucketStats := make(map[string]inOutBytes, len(s.stats))
+	for k, v := range s.stats {
+		bucketStats[k] = inOutBytes{
+			In:  v.s3InputBytes,
+			Out: v.s3OutputBytes,
+		}
+	}
+	return bucketStats
+}
+
+// delete metrics once bucket is deleted.
+func (s *bucketConnStats) delete(bucket string) {
+	s.Lock()
+	defer s.Unlock()
+
+	delete(s.stats, bucket)
 }
 
 // HTTPAPIStats holds statistics information about
@@ -124,10 +308,32 @@ func (stats *HTTPAPIStats) Dec(api string) {
 	}
 }
 
+// Get returns the current counter on input API string
+func (stats *HTTPAPIStats) Get(api string) int {
+	if stats == nil {
+		return 0
+	}
+
+	stats.RLock()
+	defer stats.RUnlock()
+
+	val, ok := stats.apiStats[api]
+	if ok {
+		return val
+	}
+
+	return 0
+}
+
 // Load returns the recorded stats.
 func (stats *HTTPAPIStats) Load() map[string]int {
-	stats.Lock()
-	defer stats.Unlock()
+	if stats == nil {
+		return map[string]int{}
+	}
+
+	stats.RLock()
+	defer stats.RUnlock()
+
 	apiStats := make(map[string]int, len(stats.apiStats))
 	for k, v := range stats.apiStats {
 		apiStats[k] = v
@@ -148,7 +354,13 @@ type HTTPStats struct {
 	currentS3Requests       HTTPAPIStats
 	totalS3Requests         HTTPAPIStats
 	totalS3Errors           HTTPAPIStats
+	totalS34xxErrors        HTTPAPIStats
+	totalS35xxErrors        HTTPAPIStats
 	totalS3Canceled         HTTPAPIStats
+}
+
+func (st *HTTPStats) loadRequestsInQueue() int32 {
+	return atomic.LoadInt32(&st.s3RequestsInQueue)
 }
 
 func (st *HTTPStats) addRequestsInQueue(i int32) {
@@ -178,6 +390,12 @@ func (st *HTTPStats) toServerHTTPStats() ServerHTTPStats {
 	serverStats.TotalS3Errors = ServerHTTPAPIStats{
 		APIStats: st.totalS3Errors.Load(),
 	}
+	serverStats.TotalS34xxErrors = ServerHTTPAPIStats{
+		APIStats: st.totalS34xxErrors.Load(),
+	}
+	serverStats.TotalS35xxErrors = ServerHTTPAPIStats{
+		APIStats: st.totalS35xxErrors.Load(),
+	}
 	serverStats.TotalS3Canceled = ServerHTTPAPIStats{
 		APIStats: st.totalS3Canceled.Load(),
 	}
@@ -185,28 +403,27 @@ func (st *HTTPStats) toServerHTTPStats() ServerHTTPStats {
 }
 
 // Update statistics from http request and response data
-func (st *HTTPStats) updateStats(api string, r *http.Request, w *logger.ResponseWriter) {
-	// A successful request has a 2xx response code or < 4xx response
-	successReq := w.StatusCode >= 200 && w.StatusCode < 400
-
-	if !strings.HasSuffix(r.URL.Path, prometheusMetricsPathLegacy) ||
-		!strings.HasSuffix(r.URL.Path, prometheusMetricsV2ClusterPath) ||
-		!strings.HasSuffix(r.URL.Path, prometheusMetricsV2NodePath) {
-		st.totalS3Requests.Inc(api)
-		if !successReq {
-			switch w.StatusCode {
-			case 0:
-			case 499:
-				// 499 is a good error, shall be counted as canceled.
-				st.totalS3Canceled.Inc(api)
-			default:
-				st.totalS3Errors.Inc(api)
-			}
-		}
-	}
+func (st *HTTPStats) updateStats(api string, w *xhttp.ResponseRecorder) {
+	st.totalS3Requests.Inc(api)
 
 	// Increment the prometheus http request response histogram with appropriate label
 	httpRequestsDuration.With(prometheus.Labels{"api": api}).Observe(w.TimeToFirstByte.Seconds())
+
+	code := w.StatusCode
+
+	switch {
+	case code == 0:
+	case code == 499:
+		// 499 is a good error, shall be counted as canceled.
+		st.totalS3Canceled.Inc(api)
+	case code >= http.StatusBadRequest:
+		st.totalS3Errors.Inc(api)
+		if code >= http.StatusInternalServerError {
+			st.totalS35xxErrors.Inc(api)
+		} else {
+			st.totalS34xxErrors.Inc(api)
+		}
+	}
 }
 
 // Prepare new HTTPStats structure

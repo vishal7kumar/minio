@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
@@ -33,9 +32,9 @@ import (
 	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/disk"
 	"github.com/minio/minio/internal/hash"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/sync/errgroup"
+	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/sync/errgroup"
 	"github.com/minio/pkg/wildcard"
 )
 
@@ -81,14 +80,14 @@ type CacheStorageInfo struct {
 // CacheObjectLayer implements primitives for cache object API layer.
 type CacheObjectLayer interface {
 	// Object operations.
-	GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error)
+	GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, err error)
 	GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error)
 	DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error)
 	DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error)
 	PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error)
 	CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error)
 	// Multipart operations.
-	NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (uploadID string, err error)
+	NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (res *NewMultipartUploadResult, err error)
 	PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (info PartInfo, err error)
 	AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error
 	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error)
@@ -118,12 +117,12 @@ type cacheObjects struct {
 	// Cache stats
 	cacheStats *CacheStats
 
-	InnerGetObjectNInfoFn          func(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error)
+	InnerGetObjectNInfoFn          func(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, err error)
 	InnerGetObjectInfoFn           func(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error)
 	InnerDeleteObjectFn            func(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error)
 	InnerPutObjectFn               func(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error)
 	InnerCopyObjectFn              func(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error)
-	InnerNewMultipartUploadFn      func(ctx context.Context, bucket, object string, opts ObjectOptions) (uploadID string, err error)
+	InnerNewMultipartUploadFn      func(ctx context.Context, bucket, object string, opts ObjectOptions) (res *NewMultipartUploadResult, err error)
 	InnerPutObjectPartFn           func(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (info PartInfo, err error)
 	InnerAbortMultipartUploadFn    func(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error
 	InnerCompleteMultipartUploadFn func(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error)
@@ -140,14 +139,14 @@ func (c *cacheObjects) updateMetadataIfChanged(ctx context.Context, dcache *disk
 	bkMeta := make(map[string]string, len(bkObjectInfo.UserDefined))
 	cacheMeta := make(map[string]string, len(cacheObjInfo.UserDefined))
 	for k, v := range bkObjectInfo.UserDefined {
-		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 			// Do not need to send any internal metadata
 			continue
 		}
 		bkMeta[http.CanonicalHeaderKey(k)] = v
 	}
 	for k, v := range cacheObjInfo.UserDefined {
-		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 			// Do not need to send any internal metadata
 			continue
 		}
@@ -232,16 +231,16 @@ func (c *cacheObjects) incCacheStats(size int64) {
 	c.cacheStats.incBytesServed(size)
 }
 
-func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
+func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, err error) {
 	if c.isCacheExclude(bucket, object) || c.skipCache() {
-		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, opts)
 	}
 	var cc *cacheControl
 	var cacheObjSize int64
 	// fetch diskCache if object is currently cached or nearest available cache drive
 	dcache, err := c.getCacheToLoc(ctx, bucket, object)
 	if err != nil {
-		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, opts)
 	}
 
 	cacheReader, numCacheHits, cacheErr := dcache.Get(ctx, bucket, object, rs, h, opts)
@@ -270,7 +269,7 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 		if cc != nil && cc.noStore {
 			cacheReader.Close()
 			c.cacheStats.incMiss()
-			bReader, err := c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+			bReader, err := c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, opts)
 			bReader.ObjInfo.CacheLookupStatus = CacheHit
 			bReader.ObjInfo.CacheStatus = CacheMiss
 			return bReader, err
@@ -305,7 +304,7 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 			cacheReader.Close()
 		}
 		c.cacheStats.incMiss()
-		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, opts)
 	}
 	// skip cache for objects with locks
 	objRetention := objectlock.GetObjectRetentionMeta(objInfo.UserDefined)
@@ -315,7 +314,7 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 			cacheReader.Close()
 		}
 		c.cacheStats.incMiss()
-		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, opts)
 	}
 	if cacheErr == nil {
 		// if ETag matches for stale cache entry, serve from cache
@@ -333,7 +332,7 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 	// Reaching here implies cache miss
 	c.cacheStats.incMiss()
 
-	bkReader, bkErr := c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+	bkReader, bkErr := c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, opts)
 
 	if bkErr != nil {
 		return bkReader, bkErr
@@ -360,7 +359,7 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 			// if range caching is disabled, download entire object.
 			rs = nil
 			// fill cache in the background for range GET requests
-			bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, rs, h, lockType, opts)
+			bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, rs, h, opts)
 			if bErr != nil {
 				return
 			}
@@ -449,7 +448,10 @@ func (c *cacheObjects) GetObjectInfo(ctx context.Context, bucket, object string,
 			return cachedObjInfo, nil
 		}
 		c.cacheStats.incMiss()
-		return ObjectInfo{}, BackendDown{}
+		if xnet.IsNetworkOrHostDown(err, false) {
+			return ObjectInfo{}, BackendDown{Err: err.Error()}
+		}
+		return ObjectInfo{}, err
 	}
 	// Reaching here implies cache miss
 	c.cacheStats.incMiss()
@@ -608,12 +610,12 @@ func newCache(config cache.Config) ([]*diskCache, bool, error) {
 				warningMsg = fmt.Sprintf("Invalid cache dir %s err : %s", dir, err.Error())
 			}
 			if rootDsk {
-				warningMsg = fmt.Sprintf("cache dir cannot be part of root disk: %s", dir)
+				warningMsg = fmt.Sprintf("cache dir cannot be part of root drive: %s", dir)
 			}
 		}
 
 		if err := checkAtimeSupport(dir); err != nil {
-			return nil, false, fmt.Errorf("Atime support required for disk caching, atime check failed with %w", err)
+			return nil, false, fmt.Errorf("Atime support required for drive caching, atime check failed with %w", err)
 		}
 
 		cache, err := newDiskCache(ctx, dir, config)
@@ -623,7 +625,7 @@ func newCache(config cache.Config) ([]*diskCache, bool, error) {
 		caches = append(caches, cache)
 	}
 	if warningMsg != "" {
-		logger.Info(color.Yellow(fmt.Sprintf("WARNING: Usage of root disk for disk caching is deprecated: %s", warningMsg)))
+		logger.Info(color.Yellow(fmt.Sprintf("WARNING: Usage of root drive for drive caching is deprecated: %s", warningMsg)))
 	}
 	return caches, migrating, nil
 }
@@ -711,7 +713,7 @@ func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *
 		if err == nil {
 			go func() {
 				// fill cache in the background
-				bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, nil, http.Header{}, readLock, ObjectOptions{})
+				bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, nil, http.Header{}, ObjectOptions{})
 				if bErr != nil {
 					return
 				}
@@ -729,7 +731,7 @@ func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *
 	if cerr != nil {
 		return putObjectFn(ctx, bucket, object, r, opts)
 	}
-	defer cLock.Unlock(lkctx.Cancel)
+	defer cLock.Unlock(lkctx)
 	// Initialize pipe to stream data to backend
 	pipeReader, pipeWriter := io.Pipe()
 	hashReader, err := hash.NewReader(pipeReader, size, "", "", r.ActualSize())
@@ -739,35 +741,30 @@ func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *
 	// Initialize pipe to stream data to cache
 	rPipe, wPipe := io.Pipe()
 	infoCh := make(chan ObjectInfo)
-	errorCh := make(chan error)
 	go func() {
+		defer close(infoCh)
 		info, err := putObjectFn(ctx, bucket, object, NewPutObjReader(hashReader), opts)
-		if err != nil {
-			close(infoCh)
-			pipeReader.CloseWithError(err)
-			rPipe.CloseWithError(err)
-			errorCh <- err
-			return
+		pipeReader.CloseWithError(err)
+		rPipe.CloseWithError(err)
+		if err == nil {
+			infoCh <- info
 		}
-		close(errorCh)
-		infoCh <- info
 	}()
 
 	go func() {
 		_, err := dcache.put(lkctx.Context(), bucket, object, rPipe, r.Size(), nil, opts, false, false)
 		if err != nil {
-			rPipe.CloseWithError(err)
-			return
+			logger.LogIf(lkctx.Context(), err)
 		}
+		// We do not care about errors to cached backend.
+		rPipe.Close()
 	}()
 
 	mwriter := cacheMultiWriter(pipeWriter, wPipe)
 	_, err = io.Copy(mwriter, r)
 	pipeWriter.Close()
 	wPipe.Close()
-
 	if err != nil {
-		err = <-errorCh
 		return ObjectInfo{}, err
 	}
 	info := <-infoCh
@@ -803,8 +800,7 @@ func (c *cacheObjects) uploadObject(ctx context.Context, oi ObjectInfo) {
 		return
 	}
 	var opts ObjectOptions
-	opts.UserDefined = make(map[string]string)
-	opts.UserDefined[xhttp.ContentMD5] = oi.UserDefined["content-md5"]
+	opts.UserDefined = cloneMSS(oi.UserDefined)
 	objInfo, err := c.InnerPutObjectFn(ctx, oi.Bucket, oi.Name, NewPutObjReader(hashReader), opts)
 	wbCommitStatus := CommitComplete
 	size := objInfo.Size
@@ -861,8 +857,8 @@ func newServerCacheObjects(ctx context.Context, config cache.Config) (CacheObjec
 		InnerGetObjectInfoFn: func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 			return newObjectLayerFn().GetObjectInfo(ctx, bucket, object, opts)
 		},
-		InnerGetObjectNInfoFn: func(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
-			return newObjectLayerFn().GetObjectNInfo(ctx, bucket, object, rs, h, lockType, opts)
+		InnerGetObjectNInfoFn: func(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, err error) {
+			return newObjectLayerFn().GetObjectNInfo(ctx, bucket, object, rs, h, opts)
 		},
 		InnerDeleteObjectFn: func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 			return newObjectLayerFn().DeleteObject(ctx, bucket, object, opts)
@@ -873,7 +869,7 @@ func newServerCacheObjects(ctx context.Context, config cache.Config) (CacheObjec
 		InnerCopyObjectFn: func(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error) {
 			return newObjectLayerFn().CopyObject(ctx, srcBucket, srcObject, destBucket, destObject, srcInfo, srcOpts, dstOpts)
 		},
-		InnerNewMultipartUploadFn: func(ctx context.Context, bucket, object string, opts ObjectOptions) (uploadID string, err error) {
+		InnerNewMultipartUploadFn: func(ctx context.Context, bucket, object string, opts ObjectOptions) (res *NewMultipartUploadResult, err error) {
 			return newObjectLayerFn().NewMultipartUpload(ctx, bucket, object, opts)
 		},
 		InnerPutObjectPartFn: func(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (info PartInfo, err error) {
@@ -900,8 +896,16 @@ func newServerCacheObjects(ctx context.Context, config cache.Config) (CacheObjec
 				cacheDiskStats[i].UsageSize = info.Used
 				cacheDiskStats[i].TotalCapacity = info.Total
 				cacheDiskStats[i].Dir = dcache.stats.Dir
-				atomic.StoreInt32(&cacheDiskStats[i].UsageState, atomic.LoadInt32(&dcache.stats.UsageState))
-				atomic.StoreUint64(&cacheDiskStats[i].UsagePercent, atomic.LoadUint64(&dcache.stats.UsagePercent))
+				if info.Total != 0 {
+					// UsageState
+					gcTriggerPct := dcache.quotaPct * dcache.highWatermark / 100
+					usedPercent := float64(info.Used) * 100 / float64(info.Total)
+					if usedPercent >= float64(gcTriggerPct) {
+						cacheDiskStats[i].UsageState = 1
+					}
+					// UsagePercent
+					cacheDiskStats[i].UsagePercent = uint64(usedPercent)
+				}
 			}
 		}
 		return cacheDiskStats
@@ -968,7 +972,7 @@ func (c *cacheObjects) queuePendingWriteback(ctx context.Context) {
 }
 
 // NewMultipartUpload - Starts a new multipart upload operation to backend - if writethrough mode is enabled, starts caching the multipart.
-func (c *cacheObjects) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (uploadID string, err error) {
+func (c *cacheObjects) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (res *NewMultipartUploadResult, err error) {
 	newMultipartUploadFn := c.InnerNewMultipartUploadFn
 	dcache, err := c.getCacheToLoc(ctx, bucket, object)
 	if err != nil {
@@ -1003,9 +1007,11 @@ func (c *cacheObjects) NewMultipartUpload(ctx context.Context, bucket, object st
 	}
 
 	// perform multipart upload on backend and cache simultaneously
-	uploadID, err = newMultipartUploadFn(ctx, bucket, object, opts)
-	dcache.NewMultipartUpload(GlobalContext, bucket, object, uploadID, opts)
-	return uploadID, err
+	res, err = newMultipartUploadFn(ctx, bucket, object, opts)
+	if err == nil {
+		dcache.NewMultipartUpload(GlobalContext, bucket, object, res.UploadID, opts)
+	}
+	return res, err
 }
 
 // PutObjectPart streams part to cache concurrently if writethrough mode is enabled. Otherwise redirects the call to remote
@@ -1137,7 +1143,7 @@ func (c *cacheObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject,
 			End:            startOffset + length,
 		}
 		// fill cache in the background
-		bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, srcBucket, srcObject, rs, http.Header{}, readLock, ObjectOptions{})
+		bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, srcBucket, srcObject, rs, http.Header{}, ObjectOptions{})
 		if bErr != nil {
 			return
 		}
@@ -1170,7 +1176,7 @@ func (c *cacheObjects) CompleteMultipartUpload(ctx context.Context, bucket, obje
 			_, err := dcache.CompleteMultipartUpload(bgContext(ctx), bucket, object, uploadID, uploadedParts, oi, opts)
 			if err != nil {
 				// fill cache in the background
-				bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, nil, http.Header{}, readLock, ObjectOptions{})
+				bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, nil, http.Header{}, ObjectOptions{})
 				if bErr != nil {
 					return
 				}

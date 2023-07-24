@@ -35,6 +35,8 @@ const (
 	dataUsageBloomName     = ".bloomcycle.bin"
 	dataUsageBloomNamePath = bucketMetaPrefix + SlashSeparator + dataUsageBloomName
 
+	backgroundHealInfoPath = bucketMetaPrefix + SlashSeparator + ".background-heal.json"
+
 	dataUsageCacheName = ".usage-cache.bin"
 )
 
@@ -54,7 +56,8 @@ func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan
 }
 
 // loadPrefixUsageFromBackend returns prefix usages found in passed buckets
-//   e.g.:  /testbucket/prefix => 355601334
+//
+//	e.g.:  /testbucket/prefix => 355601334
 func loadPrefixUsageFromBackend(ctx context.Context, objAPI ObjectLayer, bucket string) (map[string]uint64, error) {
 	z, ok := objAPI.(*erasureServerPools)
 	if !ok {
@@ -78,7 +81,7 @@ func loadPrefixUsageFromBackend(ctx context.Context, objAPI ObjectLayer, bucket 
 
 				for id, usageInfo := range cache.flattenChildrens(*root) {
 					prefix := decodeDirObject(strings.TrimPrefix(id, bucket+slashSeparator))
-					// decodeDirObject to avoid any __XL_DIR__ objects
+					// decodeDirObject to avoid any __XLDIR__ objects
 					m[prefix] += uint64(usageInfo.Size)
 				}
 			}

@@ -106,7 +106,7 @@ const (
 	skipVerify = "skip_verify"
 )
 
-// DefaultKVS is the the default K/V config system for
+// DefaultKVS is the default K/V config system for
 // the STS TLS API.
 var DefaultKVS = config.KVS{
 	config.KV{
@@ -119,7 +119,7 @@ var DefaultKVS = config.KVS{
 var Help = config.HelpKVS{
 	config.HelpKV{
 		Key:         skipVerify,
-		Description: `trust client certificates without verification. Defaults to "off" (verify)`,
+		Description: `trust client certificates without verification (default: 'off')`,
 		Optional:    true,
 		Type:        "on|off",
 	},

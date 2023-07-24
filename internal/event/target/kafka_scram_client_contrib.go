@@ -1,5 +1,5 @@
 /*
- * MinIO Object Storage (c) 2021 MinIO, Inc.
+ * MinIO Object Storage (c) 2021-2023 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@
 package target
 
 import (
-	"crypto/sha256"
 	"crypto/sha512"
 
 	"github.com/Shopify/sarama"
 	"github.com/xdg/scram"
+
+	"github.com/minio/minio/internal/hash/sha256"
 )
 
 func initScramClient(args KafkaArgs, config *sarama.Config) {

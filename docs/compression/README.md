@@ -19,7 +19,7 @@ will increase speed when the content can be compressed.
 
 ### 1. Prerequisites
 
-Install MinIO - [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide).
+Install MinIO - [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#quickstart-for-linux).
 
 ### 2. Run MinIO with compression
 
@@ -54,9 +54,9 @@ The compression settings may also be set through environment variables.
 When set, environment variables override the defined `compress` config settings in the server config.
 
 ```bash
-export MINIO_COMPRESS="on"
-export MINIO_COMPRESS_EXTENSIONS=".txt,.log,.csv,.json,.tar,.xml,.bin"
-export MINIO_COMPRESS_MIME_TYPES="text/*,application/json,application/xml"
+export MINIO_COMPRESSION_ENABLE="on"
+export MINIO_COMPRESSION_EXTENSIONS=".txt,.log,.csv,.json,.tar,.xml,.bin"
+export MINIO_COMPRESSION_MIME_TYPES="text/*,application/json,application/xml"
 ```
 
 ### 3. Compression + Encryption
@@ -76,7 +76,7 @@ To enable compression+encryption use:
 ~ mc admin config set myminio compression allow_encryption=on
 ```
 
-Or alternatively through the environment variable `MINIO_COMPRESS_ALLOW_ENCRYPTION=on`.
+Or alternatively through the environment variable `MINIO_COMPRESSION_ALLOW_ENCRYPTION=on`.
 
 ### 4. Excluded Types
 
@@ -116,10 +116,6 @@ Below is a list of common files and content-types which are typically not suitab
 All files with these extensions and mime types are excluded from compression,
 even if compression is enabled for all types.
 
-### 5. Notes
-
-- MinIO does not support compression for Gateway (Azure/GCS/NAS) implementations.
-
 ## To test the setup
 
 To test this setup, practice put calls to the server using `mc` and use `mc ls` on
@@ -127,8 +123,7 @@ the data directory to view the size of the object.
 
 ## Explore Further
 
-- [Use `mc` with MinIO Server](https://docs.min.io/docs/minio-client-quickstart-guide)
-- [Use `aws-cli` with MinIO Server](https://docs.min.io/docs/aws-cli-with-minio)
-- [Use `s3cmd` with MinIO Server](https://docs.min.io/docs/s3cmd-with-minio)
-- [Use `minio-go` SDK with MinIO Server](https://docs.min.io/docs/golang-client-quickstart-guide)
-- [The MinIO documentation website](https://docs.min.io)
+- [Use `mc` with MinIO Server](https://min.io/docs/minio/linux/reference/minio-mc.html)
+- [Use `aws-cli` with MinIO Server](https://min.io/docs/minio/linux/integrations/aws-cli-with-minio.html)
+- [Use `minio-go` SDK with MinIO Server](https://min.io/docs/minio/linux/developers/go/minio-go.html)
+- [The MinIO documentation website](https://min.io/docs/minio/linux/index.html)

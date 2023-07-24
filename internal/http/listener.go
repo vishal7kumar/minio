@@ -117,37 +117,57 @@ func (listener *httpListener) Addrs() (addrs []net.Addr) {
 	return addrs
 }
 
+// TCPOptions specify customizable TCP optimizations on raw socket
+type TCPOptions struct {
+	UserTimeout int              // this value is expected to be in milliseconds
+	Interface   string           // this is a VRF device passed via `--interface` flag
+	Trace       func(msg string) // Trace when starting.
+}
+
 // newHTTPListener - creates new httpListener object which is interface compatible to net.Listener.
 // httpListener is capable to
 // * listen to multiple addresses
 // * controls incoming connections only doing HTTP protocol
-func newHTTPListener(ctx context.Context, serverAddrs []string) (listener *httpListener, err error) {
-	var tcpListeners []*net.TCPListener
+func newHTTPListener(ctx context.Context, serverAddrs []string, opts TCPOptions) (listener *httpListener, listenErrs []error) {
+	tcpListeners := make([]*net.TCPListener, 0, len(serverAddrs))
+	listenErrs = make([]error, len(serverAddrs))
 
-	// Close all opened listeners on error
-	defer func() {
-		if err == nil {
-			return
-		}
+	// Unix listener with special TCP options.
+	listenCfg := net.ListenConfig{
+		Control: setTCPParametersFn(opts),
+	}
 
-		for _, tcpListener := range tcpListeners {
-			// Ignore error on close.
-			tcpListener.Close()
-		}
-	}()
+	for i, serverAddr := range serverAddrs {
+		var (
+			l net.Listener
+			e error
+		)
+		if l, e = listenCfg.Listen(ctx, "tcp", serverAddr); e != nil {
+			if opts.Trace != nil {
+				opts.Trace(fmt.Sprint("listenCfg.Listen: ", e.Error()))
+			}
 
-	for _, serverAddr := range serverAddrs {
-		var l net.Listener
-		if l, err = listenCfg.Listen(ctx, "tcp", serverAddr); err != nil {
-			return nil, err
+			listenErrs[i] = e
+			continue
 		}
 
 		tcpListener, ok := l.(*net.TCPListener)
 		if !ok {
-			return nil, fmt.Errorf("unexpected listener type found %v, expected net.TCPListener", l)
+			listenErrs[i] = fmt.Errorf("unexpected listener type found %v, expected net.TCPListener", l)
+			if opts.Trace != nil {
+				opts.Trace(fmt.Sprint("net.TCPListener: ", listenErrs[i].Error()))
+			}
+			continue
 		}
-
+		if opts.Trace != nil {
+			opts.Trace(fmt.Sprint("adding listener to ", tcpListener.Addr()))
+		}
 		tcpListeners = append(tcpListeners, tcpListener)
+	}
+
+	if len(tcpListeners) == 0 {
+		// No listeners initialized, no need to continue
+		return
 	}
 
 	listener = &httpListener{
@@ -155,7 +175,10 @@ func newHTTPListener(ctx context.Context, serverAddrs []string) (listener *httpL
 		acceptCh:     make(chan acceptResult, len(tcpListeners)),
 	}
 	listener.ctx, listener.ctxCanceler = context.WithCancel(ctx)
+	if opts.Trace != nil {
+		opts.Trace(fmt.Sprint("opening ", len(listener.tcpListeners), " listeners"))
+	}
 	listener.start()
 
-	return listener, nil
+	return
 }

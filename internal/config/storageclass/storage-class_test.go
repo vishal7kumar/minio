@@ -102,7 +102,8 @@ func TestValidateParity(t *testing.T) {
 		{2, 4, true, 16},
 		{3, 3, true, 16},
 		{0, 0, true, 16},
-		{1, 4, false, 16},
+		{1, 4, true, 16},
+		{0, 4, true, 16},
 		{7, 6, false, 16},
 		{9, 0, false, 16},
 		{9, 9, false, 16},
@@ -140,8 +141,9 @@ func TestParityCount(t *testing.T) {
 				Parity: 8,
 			},
 			RRS: StorageClass{
-				Parity: 0,
+				Parity: 2,
 			},
+			initialized: true,
 		}
 		// Set env var for test case 4
 		if i+1 == 4 {
@@ -157,11 +159,11 @@ func TestParityCount(t *testing.T) {
 		}
 		parity := scfg.GetParityForSC(tt.sc)
 		if (tt.disksCount - parity) != tt.expectedData {
-			t.Errorf("Test %d, Expected data disks %d, got %d", i+1, tt.expectedData, tt.disksCount-parity)
+			t.Errorf("Test %d, Expected data drives %d, got %d", i+1, tt.expectedData, tt.disksCount-parity)
 			continue
 		}
 		if parity != tt.expectedParity {
-			t.Errorf("Test %d, Expected parity disks %d, got %d", i+1, tt.expectedParity, parity)
+			t.Errorf("Test %d, Expected parity drives %d, got %d", i+1, tt.expectedParity, parity)
 		}
 	}
 }

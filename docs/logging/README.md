@@ -17,7 +17,7 @@ Console target is on always and cannot be disabled.
 
 HTTP target logs to a generic HTTP endpoint in JSON format and is not enabled by default. To enable HTTP target logging you would have to update your MinIO server configuration using `mc admin config set` command.
 
-Assuming `mc` is already [configured](https://docs.min.io/docs/minio-client-quickstart-guide.html)
+Assuming `mc` is already [configured](https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart)
 
 ```
 mc admin config get myminio/ logger_webhook
@@ -42,7 +42,7 @@ minio server /mnt/data
 
 ## Audit Targets
 
-Assuming `mc` is already [configured](https://docs.min.io/docs/minio-client-quickstart-guide.html)
+Assuming `mc` is already [configured](https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart)
 
 ### Audit HTTP Target
 
@@ -111,7 +111,6 @@ NOTE:
   "responseHeader": {
     "Accept-Ranges": "bytes",
     "Content-Length": "0",
-    "Content-Security-Policy": "block-all-mixed-content",
     "ETag": "4939450d1beec11e10a91ee7700bb593",
     "Server": "MinIO",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
@@ -128,7 +127,7 @@ NOTE:
       "hosts": {
         "poolId": 1,
         "setId": 1,
-        "disks": [
+        "drives": [
           "/mnt/data1",
           "/mnt/data2",
           "/mnt/data3",
@@ -223,5 +222,5 @@ NOTE:
 
 ## Explore Further
 
-- [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide)
-- [Configure MinIO Server with TLS](https://docs.min.io/docs/how-to-secure-access-to-minio-server-with-tls)
+- [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#quickstart-for-linux)
+- [Configure MinIO Server with TLS](https://min.io/docs/minio/linux/operations/network-encryption.html)

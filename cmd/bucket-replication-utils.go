@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -21,12 +21,14 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/replication"
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -494,8 +496,7 @@ func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) Repl
 			oi.VersionPurgeStatusInternal = fmt.Sprintf("%s=%s;", rcfg.Config.RoleArn, oi.VersionPurgeStatus)
 		}
 		for k, v := range oi.UserDefined {
-			switch {
-			case strings.EqualFold(k, ReservedMetadataPrefixLower+ReplicationReset):
+			if strings.EqualFold(k, ReservedMetadataPrefixLower+ReplicationReset) {
 				delete(oi.UserDefined, k)
 				oi.UserDefined[targetResetHeader(rcfg.Config.RoleArn)] = v
 			}
@@ -503,37 +504,50 @@ func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) Repl
 	}
 	var dsc ReplicateDecision
 	var tgtStatuses map[string]replication.StatusType
+	var purgeStatuses map[string]VersionPurgeStatusType
+
 	if oi.DeleteMarker || !oi.VersionPurgeStatus.Empty() {
 		dsc = checkReplicateDelete(GlobalContext, oi.Bucket, ObjectToDelete{
 			ObjectV: ObjectV{
 				ObjectName: oi.Name,
 				VersionID:  oi.VersionID,
 			},
-		}, oi, ObjectOptions{}, nil)
+		}, oi, ObjectOptions{
+			Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+			VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+		}, nil)
 	} else {
 		dsc = mustReplicate(GlobalContext, oi.Bucket, oi.Name, getMustReplicateOptions(ObjectInfo{
 			UserDefined: oi.UserDefined,
 		}, replication.HealReplicationType, ObjectOptions{}))
 	}
 	tgtStatuses = replicationStatusesMap(oi.ReplicationStatusInternal)
-
+	purgeStatuses = versionPurgeStatusesMap(oi.VersionPurgeStatusInternal)
 	existingObjResync := rcfg.Resync(GlobalContext, oi, &dsc, tgtStatuses)
-
+	tm, _ := time.Parse(time.RFC3339Nano, oi.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp])
 	return ReplicateObjectInfo{
-		ObjectInfo:        oi,
-		OpType:            replication.HealReplicationType,
-		Dsc:               dsc,
-		ExistingObjResync: existingObjResync,
-		TargetStatuses:    tgtStatuses,
+		ObjectInfo:           oi,
+		OpType:               replication.HealReplicationType,
+		Dsc:                  dsc,
+		ExistingObjResync:    existingObjResync,
+		TargetStatuses:       tgtStatuses,
+		TargetPurgeStatuses:  purgeStatuses,
+		ReplicationTimestamp: tm,
 	}
 }
 
+func (ri *ReplicateObjectInfo) getReplicationState() ReplicationState {
+	rs := ri.ObjectInfo.getReplicationState()
+	rs.ReplicateDecisionStr = ri.Dsc.String()
+	return rs
+}
+
 // vID here represents the versionID client specified in request - need to distinguish between delete marker and delete marker deletion
-func (o *ObjectInfo) getReplicationState(dsc string, vID string, heal bool) ReplicationState {
+func (o *ObjectInfo) getReplicationState() ReplicationState {
 	rs := ReplicationState{
 		ReplicationStatusInternal:  o.ReplicationStatusInternal,
 		VersionPurgeStatusInternal: o.VersionPurgeStatusInternal,
-		ReplicateDecisionStr:       dsc,
+		ReplicateDecisionStr:       o.replicationDecision,
 		Targets:                    make(map[string]replication.StatusType),
 		PurgeTargets:               make(map[string]VersionPurgeStatusType),
 		ResetStatusesMap:           make(map[string]string),
@@ -622,19 +636,29 @@ func (v VersionPurgeStatusType) Pending() bool {
 	return v == Pending || v == Failed
 }
 
-type replicationResyncState struct {
+type replicationResyncer struct {
 	// map of bucket to their resync status
-	statusMap map[string]BucketReplicationResyncStatus
+	statusMap      map[string]BucketReplicationResyncStatus
+	workerSize     int
+	resyncCancelCh chan struct{}
+	workerCh       chan struct{}
 	sync.RWMutex
 }
 
 const (
-	replicationDir      = "replication"
+	replicationDir      = ".replication"
 	resyncFileName      = "resync.bin"
 	resyncMetaFormat    = 1
 	resyncMetaVersionV1 = 1
 	resyncMetaVersion   = resyncMetaVersionV1
 )
+
+type resyncOpts struct {
+	bucket       string
+	arn          string
+	resyncID     string
+	resyncBefore time.Time
+}
 
 // ResyncStatusType status of resync operation
 type ResyncStatusType int
@@ -642,6 +666,10 @@ type ResyncStatusType int
 const (
 	// NoResync - no resync in progress
 	NoResync ResyncStatusType = iota
+	// ResyncPending - resync pending
+	ResyncPending
+	// ResyncCanceled - resync canceled
+	ResyncCanceled
 	// ResyncStarted -  resync in progress
 	ResyncStarted
 	// ResyncCompleted -  resync finished
@@ -649,6 +677,10 @@ const (
 	// ResyncFailed -  resync failed
 	ResyncFailed
 )
+
+func (rt ResyncStatusType) isValid() bool {
+	return rt != NoResync
+}
 
 func (rt ResyncStatusType) String() string {
 	switch rt {
@@ -658,6 +690,10 @@ func (rt ResyncStatusType) String() string {
 		return "Completed"
 	case ResyncFailed:
 		return "Failed"
+	case ResyncPending:
+		return "Pending"
+	case ResyncCanceled:
+		return "Canceled"
 	default:
 		return ""
 	}
@@ -665,8 +701,8 @@ func (rt ResyncStatusType) String() string {
 
 // TargetReplicationResyncStatus status of resync of bucket for a specific target
 type TargetReplicationResyncStatus struct {
-	StartTime time.Time `json:"startTime" msg:"st"`
-	EndTime   time.Time `json:"endTime" msg:"et"`
+	StartTime  time.Time `json:"startTime" msg:"st"`
+	LastUpdate time.Time `json:"lastUpdated" msg:"lst"`
 	// Resync ID assigned to this reset
 	ResyncID string `json:"resyncID" msg:"id"`
 	// ResyncBeforeDate - resync all objects created prior to this date
@@ -693,6 +729,14 @@ type BucketReplicationResyncStatus struct {
 	TargetsMap map[string]TargetReplicationResyncStatus `json:"resyncMap,omitempty" msg:"brs"`
 	ID         int                                      `json:"id" msg:"id"`
 	LastUpdate time.Time                                `json:"lastUpdate" msg:"lu"`
+}
+
+func (rs *BucketReplicationResyncStatus) cloneTgtStats() (m map[string]TargetReplicationResyncStatus) {
+	m = make(map[string]TargetReplicationResyncStatus)
+	for arn, st := range rs.TargetsMap {
+		m[arn] = st
+	}
+	return
 }
 
 func newBucketResyncStatus(bucket string) BucketReplicationResyncStatus {
@@ -724,3 +768,52 @@ func parseSizeFromContentRange(h http.Header) (sz int64, err error) {
 	}
 	return int64(usz), nil
 }
+
+func extractReplicateDiffOpts(q url.Values) (opts madmin.ReplDiffOpts) {
+	opts.Verbose = q.Get("verbose") == "true"
+	opts.ARN = q.Get("arn")
+	opts.Prefix = q.Get("prefix")
+	return
+}
+
+const (
+	replicationMRFDir = bucketMetaPrefix + SlashSeparator + replicationDir + SlashSeparator + "mrf"
+	mrfMetaFormat     = 1
+	mrfMetaVersionV1  = 1
+	mrfMetaVersion    = mrfMetaVersionV1
+)
+
+// MRFReplicateEntry mrf entry to save to disk
+type MRFReplicateEntry struct {
+	Bucket     string `json:"bucket" msg:"b"`
+	Object     string `json:"object" msg:"o"`
+	versionID  string `json:"-"`
+	RetryCount int    `json:"retryCount" msg:"rc"`
+}
+
+// MRFReplicateEntries has the map of MRF entries to save to disk
+type MRFReplicateEntries struct {
+	Entries map[string]MRFReplicateEntry `json:"entries" msg:"e"`
+	Version int                          `json:"version" msg:"v"`
+}
+
+// ToMRFEntry returns the relevant info needed by MRF
+func (ri ReplicateObjectInfo) ToMRFEntry() MRFReplicateEntry {
+	return MRFReplicateEntry{
+		Bucket:     ri.Bucket,
+		Object:     ri.Name,
+		versionID:  ri.VersionID,
+		RetryCount: int(ri.RetryCount),
+	}
+}
+
+func getReplicationStatsPath() string {
+	return bucketMetaPrefix + SlashSeparator + replicationDir + SlashSeparator + "replication.stats"
+}
+
+const (
+	replStatsMetaFormat   = 1
+	replStatsVersionV1    = 1
+	replStatsVersion      = replStatsVersionV1
+	replStatsSaveInterval = time.Minute * 5
+)

@@ -23,13 +23,13 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
-	"io/ioutil"
 	"os"
 	"path"
 	"testing"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/hash"
+	"github.com/minio/minio/internal/ioutil"
 )
 
 func md5Header(data []byte) map[string]string {
@@ -48,14 +48,14 @@ func testObjectAPIPutObject(obj ObjectLayer, instanceType string, t TestErrHandl
 	object := "minio-object"
 
 	// Create bucket.
-	err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
 	}
 
 	// Creating a dummy bucket for tests.
-	err = obj.MakeBucketWithLocation(context.Background(), "unused-bucket", BucketOptions{})
+	err = obj.MakeBucket(context.Background(), "unused-bucket", MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -80,146 +80,131 @@ func testObjectAPIPutObject(obj ObjectLayer, instanceType string, t TestErrHandl
 		expectedMd5   string
 		expectedError error
 	}{
-		// Test case  1-4.
 		// Cases with invalid bucket name.
-		{".test", "obj", []byte(""), nil, "", 0, "", BucketNotFound{Bucket: ".test"}},
-		{"------", "obj", []byte(""), nil, "", 0, "", BucketNotFound{Bucket: "------"}},
-		{
-			"$this-is-not-valid-too", "obj", []byte(""), nil, "", 0, "",
-			BucketNotFound{Bucket: "$this-is-not-valid-too"},
+		0: {bucketName: ".test", objName: "obj", inputData: []byte(""), expectedError: BucketNotFound{Bucket: ".test"}},
+		1: {bucketName: "------", objName: "obj", inputData: []byte(""), expectedError: BucketNotFound{Bucket: "------"}},
+		2: {
+			bucketName: "$this-is-not-valid-too", objName: "obj", inputData: []byte(""),
+			expectedError: BucketNotFound{Bucket: "$this-is-not-valid-too"},
 		},
-		{"a", "obj", []byte(""), nil, "", 0, "", BucketNotFound{Bucket: "a"}},
+		3: {bucketName: "a", objName: "obj", inputData: []byte(""), expectedError: BucketNotFound{Bucket: "a"}},
 
-		// Test case - 5.
 		// Case with invalid object names.
-		{bucket, "", []byte(""), nil, "", 0, "", ObjectNameInvalid{Bucket: bucket, Object: ""}},
+		4: {bucketName: bucket, inputData: []byte(""), expectedError: ObjectNameInvalid{Bucket: bucket, Object: ""}},
 
-		// Test case - 6.
 		// Valid object and bucket names but non-existent bucket.
-		{"abc", "def", []byte(""), nil, "", 0, "", BucketNotFound{Bucket: "abc"}},
+		5: {bucketName: "abc", objName: "def", inputData: []byte(""), expectedError: BucketNotFound{Bucket: "abc"}},
 
-		// Test case - 7.
 		// Input to replicate Md5 mismatch.
-		{
-			bucket, object, []byte(""),
-			map[string]string{"etag": "d41d8cd98f00b204e9800998ecf8427f"},
-			"", 0, "",
-			hash.BadDigest{ExpectedMD5: "d41d8cd98f00b204e9800998ecf8427f", CalculatedMD5: "d41d8cd98f00b204e9800998ecf8427e"},
+		6: {
+			bucketName: bucket, objName: object, inputData: []byte(""),
+			inputMeta:     map[string]string{"etag": "d41d8cd98f00b204e9800998ecf8427f"},
+			expectedError: hash.BadDigest{ExpectedMD5: "d41d8cd98f00b204e9800998ecf8427f", CalculatedMD5: "d41d8cd98f00b204e9800998ecf8427e"},
 		},
 
-		// Test case - 8.
 		// With incorrect sha256.
-		{
-			bucket, object, []byte("abcd"),
-			map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331f"},
-			"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031580", int64(len("abcd")),
-			"",
-			hash.SHA256Mismatch{
+		7: {
+			bucketName: bucket, objName: object, inputData: []byte("abcd"),
+			inputMeta:   map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331f"},
+			inputSHA256: "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031580", intputDataSize: int64(len("abcd")),
+			expectedError: hash.SHA256Mismatch{
 				ExpectedSHA256:   "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031580",
 				CalculatedSHA256: "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
 			},
 		},
 
-		// Test case - 9.
 		// Input with size more than the size of actual data inside the reader.
-		{
-			bucket, object, []byte("abcd"),
-			map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331e"},
-			"", int64(len("abcd") + 1), "",
-			hash.BadDigest{ExpectedMD5: "e2fc714c4727ee9395f324cd2e7f331e", CalculatedMD5: "e2fc714c4727ee9395f324cd2e7f331f"},
+		8: {
+			bucketName: bucket, objName: object, inputData: []byte("abcd"),
+			inputMeta: map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331e"}, intputDataSize: int64(len("abcd") + 1),
+			expectedError: hash.BadDigest{ExpectedMD5: "e2fc714c4727ee9395f324cd2e7f331e", CalculatedMD5: "e2fc714c4727ee9395f324cd2e7f331f"},
 		},
 
-		// Test case - 10.
 		// Input with size less than the size of actual data inside the reader.
-		{
-			bucket, object, []byte("abcd"),
-			map[string]string{"etag": "900150983cd24fb0d6963f7d28e17f73"},
-			"", int64(len("abcd") - 1), "",
-			hash.BadDigest{ExpectedMD5: "900150983cd24fb0d6963f7d28e17f73", CalculatedMD5: "900150983cd24fb0d6963f7d28e17f72"},
+		9: {
+			bucketName: bucket, objName: object, inputData: []byte("abcd"),
+			inputMeta: map[string]string{"etag": "900150983cd24fb0d6963f7d28e17f73"}, intputDataSize: int64(len("abcd") - 1),
+			expectedError: ioutil.ErrOverread,
 		},
 
-		// Test case - 11-14.
 		// Validating for success cases.
-		{bucket, object, []byte("abcd"), map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331f"}, "", int64(len("abcd")), "", nil},
-		{bucket, object, []byte("efgh"), map[string]string{"etag": "1f7690ebdd9b4caf8fab49ca1757bf27"}, "", int64(len("efgh")), "", nil},
-		{bucket, object, []byte("ijkl"), map[string]string{"etag": "09a0877d04abf8759f99adec02baf579"}, "", int64(len("ijkl")), "", nil},
-		{bucket, object, []byte("mnop"), map[string]string{"etag": "e132e96a5ddad6da8b07bba6f6131fef"}, "", int64(len("mnop")), "", nil},
+		10: {bucketName: bucket, objName: object, inputData: []byte("abcd"), inputMeta: map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331f"}, intputDataSize: int64(len("abcd"))},
+		11: {bucketName: bucket, objName: object, inputData: []byte("efgh"), inputMeta: map[string]string{"etag": "1f7690ebdd9b4caf8fab49ca1757bf27"}, intputDataSize: int64(len("efgh"))},
+		12: {bucketName: bucket, objName: object, inputData: []byte("ijkl"), inputMeta: map[string]string{"etag": "09a0877d04abf8759f99adec02baf579"}, intputDataSize: int64(len("ijkl"))},
+		13: {bucketName: bucket, objName: object, inputData: []byte("mnop"), inputMeta: map[string]string{"etag": "e132e96a5ddad6da8b07bba6f6131fef"}, intputDataSize: int64(len("mnop"))},
 
-		// Test case 15-17.
 		// With no metadata
-		{bucket, object, data, nil, "", int64(len(data)), getMD5Hash(data), nil},
-		{bucket, object, nilBytes, nil, "", int64(len(nilBytes)), getMD5Hash(nilBytes), nil},
-		{bucket, object, fiveMBBytes, nil, "", int64(len(fiveMBBytes)), getMD5Hash(fiveMBBytes), nil},
+		14: {bucketName: bucket, objName: object, inputData: data, intputDataSize: int64(len(data)), expectedMd5: getMD5Hash(data)},
+		15: {bucketName: bucket, objName: object, inputData: nilBytes, intputDataSize: int64(len(nilBytes)), expectedMd5: getMD5Hash(nilBytes)},
+		16: {bucketName: bucket, objName: object, inputData: fiveMBBytes, intputDataSize: int64(len(fiveMBBytes)), expectedMd5: getMD5Hash(fiveMBBytes)},
 
-		// Test case 18-20.
 		// With arbitrary metadata
-		{bucket, object, data, map[string]string{"answer": "42"}, "", int64(len(data)), getMD5Hash(data), nil},
-		{bucket, object, nilBytes, map[string]string{"answer": "42"}, "", int64(len(nilBytes)), getMD5Hash(nilBytes), nil},
-		{bucket, object, fiveMBBytes, map[string]string{"answer": "42"}, "", int64(len(fiveMBBytes)), getMD5Hash(fiveMBBytes), nil},
+		17: {bucketName: bucket, objName: object, inputData: data, inputMeta: map[string]string{"answer": "42"}, intputDataSize: int64(len(data)), expectedMd5: getMD5Hash(data)},
+		18: {bucketName: bucket, objName: object, inputData: nilBytes, inputMeta: map[string]string{"answer": "42"}, intputDataSize: int64(len(nilBytes)), expectedMd5: getMD5Hash(nilBytes)},
+		19: {bucketName: bucket, objName: object, inputData: fiveMBBytes, inputMeta: map[string]string{"answer": "42"}, intputDataSize: int64(len(fiveMBBytes)), expectedMd5: getMD5Hash(fiveMBBytes)},
 
-		// Test case 21-23.
 		// With valid md5sum and sha256.
-		{bucket, object, data, md5Header(data), getSHA256Hash(data), int64(len(data)), getMD5Hash(data), nil},
-		{bucket, object, nilBytes, md5Header(nilBytes), getSHA256Hash(nilBytes), int64(len(nilBytes)), getMD5Hash(nilBytes), nil},
-		{bucket, object, fiveMBBytes, md5Header(fiveMBBytes), getSHA256Hash(fiveMBBytes), int64(len(fiveMBBytes)), getMD5Hash(fiveMBBytes), nil},
+		20: {bucketName: bucket, objName: object, inputData: data, inputMeta: md5Header(data), inputSHA256: getSHA256Hash(data), intputDataSize: int64(len(data)), expectedMd5: getMD5Hash(data)},
+		21: {bucketName: bucket, objName: object, inputData: nilBytes, inputMeta: md5Header(nilBytes), inputSHA256: getSHA256Hash(nilBytes), intputDataSize: int64(len(nilBytes)), expectedMd5: getMD5Hash(nilBytes)},
+		22: {bucketName: bucket, objName: object, inputData: fiveMBBytes, inputMeta: md5Header(fiveMBBytes), inputSHA256: getSHA256Hash(fiveMBBytes), intputDataSize: int64(len(fiveMBBytes)), expectedMd5: getMD5Hash(fiveMBBytes)},
 
-		// Test case 24-26.
 		// data with invalid md5sum in header
-		{
-			bucket, object, data, invalidMD5Header, "", int64(len(data)), getMD5Hash(data),
-			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(data)},
+		23: {
+			bucketName: bucket, objName: object, inputData: data, inputMeta: invalidMD5Header, intputDataSize: int64(len(data)), expectedMd5: getMD5Hash(data),
+			expectedError: hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(data)},
 		},
-		{
-			bucket, object, nilBytes, invalidMD5Header, "", int64(len(nilBytes)), getMD5Hash(nilBytes),
-			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(nilBytes)},
+		24: {
+			bucketName: bucket, objName: object, inputData: nilBytes, inputMeta: invalidMD5Header, intputDataSize: int64(len(nilBytes)), expectedMd5: getMD5Hash(nilBytes),
+			expectedError: hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(nilBytes)},
 		},
-		{
-			bucket, object, fiveMBBytes, invalidMD5Header, "", int64(len(fiveMBBytes)), getMD5Hash(fiveMBBytes),
-			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(fiveMBBytes)},
+		25: {
+			bucketName: bucket, objName: object, inputData: fiveMBBytes, inputMeta: invalidMD5Header, intputDataSize: int64(len(fiveMBBytes)), expectedMd5: getMD5Hash(fiveMBBytes),
+			expectedError: hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(fiveMBBytes)},
 		},
 
-		// Test case 27-29.
 		// data with size different from the actual number of bytes available in the reader
-		{bucket, object, data, nil, "", int64(len(data) - 1), getMD5Hash(data[:len(data)-1]), nil},
-		{bucket, object, nilBytes, nil, "", int64(len(nilBytes) + 1), getMD5Hash(nilBytes), IncompleteBody{Bucket: bucket, Object: object}},
-		{bucket, object, fiveMBBytes, nil, "", 0, getMD5Hash(fiveMBBytes), nil},
+		26: {bucketName: bucket, objName: object, inputData: data, intputDataSize: int64(len(data) - 1), expectedMd5: getMD5Hash(data[:len(data)-1]), expectedError: ioutil.ErrOverread},
+		27: {bucketName: bucket, objName: object, inputData: nilBytes, intputDataSize: int64(len(nilBytes) + 1), expectedMd5: getMD5Hash(nilBytes), expectedError: IncompleteBody{Bucket: bucket, Object: object}},
+		28: {bucketName: bucket, objName: object, inputData: fiveMBBytes, expectedMd5: getMD5Hash(fiveMBBytes), expectedError: ioutil.ErrOverread},
 
-		// Test case 30
 		// valid data with X-Amz-Meta- meta
-		{bucket, object, data, map[string]string{"X-Amz-Meta-AppID": "a42"}, "", int64(len(data)), getMD5Hash(data), nil},
+		29: {bucketName: bucket, objName: object, inputData: data, inputMeta: map[string]string{"X-Amz-Meta-AppID": "a42"}, intputDataSize: int64(len(data)), expectedMd5: getMD5Hash(data)},
 
-		// Test case 31
 		// Put an empty object with a trailing slash
-		{bucket, "emptydir/", []byte{}, nil, "", 0, getMD5Hash([]byte{}), nil},
-		// Test case 32
+		30: {bucketName: bucket, objName: "emptydir/", inputData: []byte{}, expectedMd5: getMD5Hash([]byte{})},
 		// Put an object inside the empty directory
-		{bucket, "emptydir/" + object, data, nil, "", int64(len(data)), getMD5Hash(data), nil},
-		// Test case 33
-		// Put the empty object with a trailing slash again (refer to Test case 31), this needs to succeed
-		{bucket, "emptydir/", []byte{}, nil, "", 0, getMD5Hash([]byte{}), nil},
-	}
+		31: {bucketName: bucket, objName: "emptydir/" + object, inputData: data, intputDataSize: int64(len(data)), expectedMd5: getMD5Hash(data)},
+		// Put the empty object with a trailing slash again (refer to Test case 30), this needs to succeed
+		32: {bucketName: bucket, objName: "emptydir/", inputData: []byte{}, expectedMd5: getMD5Hash([]byte{})},
 
+		// With invalid crc32.
+		33: {
+			bucketName: bucket, objName: object, inputData: []byte("abcd"),
+			inputMeta:      map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331f", "x-amz-checksum-crc32": "abcd"},
+			intputDataSize: int64(len("abcd")),
+		},
+	}
 	for i, testCase := range testCases {
 		in := mustGetPutObjReader(t, bytes.NewReader(testCase.inputData), testCase.intputDataSize, testCase.inputMeta["etag"], testCase.inputSHA256)
 		objInfo, actualErr := obj.PutObject(context.Background(), testCase.bucketName, testCase.objName, in, ObjectOptions{UserDefined: testCase.inputMeta})
 		if actualErr != nil && testCase.expectedError == nil {
-			t.Errorf("Test %d: %s: Expected to pass, but failed with: error %s.", i+1, instanceType, actualErr.Error())
+			t.Errorf("Test %d: %s: Expected to pass, but failed with: error %s.", i, instanceType, actualErr.Error())
 			continue
 		}
 		if actualErr == nil && testCase.expectedError != nil {
-			t.Errorf("Test %d: %s: Expected to fail with error \"%s\", but passed instead.", i+1, instanceType, testCase.expectedError.Error())
+			t.Errorf("Test %d: %s: Expected to fail with error \"%s\", but passed instead.", i, instanceType, testCase.expectedError.Error())
 			continue
 		}
 		// Failed as expected, but does it fail for the expected reason.
 		if actualErr != nil && actualErr != testCase.expectedError {
-			t.Errorf("Test %d: %s: Expected to fail with error \"%v\", but instead failed with error \"%v\" instead.", i+1, instanceType, testCase.expectedError, actualErr)
+			t.Errorf("Test %d: %s: Expected to fail with error \"%v\", but instead failed with error \"%v\" instead.", i, instanceType, testCase.expectedError, actualErr)
 			continue
 		}
 		// Test passes as expected, but the output values are verified for correctness here.
 		if actualErr == nil {
 			// Asserting whether the md5 output is correct.
 			if expectedMD5, ok := testCase.inputMeta["etag"]; ok && expectedMD5 != objInfo.ETag {
-				t.Errorf("Test %d: %s: Calculated Md5 different from the actual one %s.", i+1, instanceType, objInfo.ETag)
+				t.Errorf("Test %d: %s: Calculated Md5 different from the actual one %s.", i, instanceType, objInfo.ETag)
 				continue
 			}
 		}
@@ -239,14 +224,14 @@ func testObjectAPIPutObjectDiskNotFound(obj ObjectLayer, instanceType string, di
 	object := "minio-object"
 
 	// Create bucket.
-	err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
 	}
 
 	// Creating a dummy bucket for tests.
-	err = obj.MakeBucketWithLocation(context.Background(), "unused-bucket", BucketOptions{})
+	err = obj.MakeBucket(context.Background(), "unused-bucket", MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -351,7 +336,7 @@ func testObjectAPIPutObjectStaleFiles(obj ObjectLayer, instanceType string, disk
 	object := "minio-object"
 
 	// Create bucket.
-	err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -367,7 +352,7 @@ func testObjectAPIPutObjectStaleFiles(obj ObjectLayer, instanceType string, disk
 
 	for _, disk := range disks {
 		tmpMetaDir := path.Join(disk, minioMetaTmpBucket)
-		files, err := ioutil.ReadDir(tmpMetaDir)
+		files, err := os.ReadDir(tmpMetaDir)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -396,18 +381,19 @@ func testObjectAPIMultipartPutObjectStaleFiles(obj ObjectLayer, instanceType str
 	object := "minio-object"
 
 	// Create bucket.
-	err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
 	}
 	opts := ObjectOptions{}
 	// Initiate Multipart Upload on the above created bucket.
-	uploadID, err := obj.NewMultipartUpload(context.Background(), bucket, object, opts)
+	res, err := obj.NewMultipartUpload(context.Background(), bucket, object, opts)
 	if err != nil {
 		// Failed to create NewMultipartUpload, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
 	}
+	uploadID := res.UploadID
 
 	// Upload part1.
 	fiveMBBytes := bytes.Repeat([]byte("a"), 5*humanize.MiByte)
@@ -445,9 +431,9 @@ func testObjectAPIMultipartPutObjectStaleFiles(obj ObjectLayer, instanceType str
 
 	for _, disk := range disks {
 		tmpMetaDir := path.Join(disk, minioMetaTmpBucket)
-		files, err := ioutil.ReadDir(tmpMetaDir)
+		files, err := os.ReadDir(tmpMetaDir)
 		if err != nil {
-			// Its OK to have non-existen tmpMetaDir.
+			// It's OK to have non-existing tmpMetaDir.
 			if osIsNotExist(err) {
 				continue
 			}

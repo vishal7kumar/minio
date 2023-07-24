@@ -18,10 +18,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"path"
 	"path/filepath"
@@ -31,7 +33,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/zstd"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
@@ -46,13 +48,18 @@ type dataUsageHash string
 // sizeHistogram is a size histogram.
 type sizeHistogram [dataUsageBucketLen]uint64
 
+// versionsHistogram is a histogram of number of versions in an object.
+type versionsHistogram [dataUsageVersionLen]uint64
+
 type dataUsageEntry struct {
 	Children dataUsageHashMap `msg:"ch"`
 	// These fields do no include any children.
 	Size             int64                `msg:"sz"`
 	Objects          uint64               `msg:"os"`
 	Versions         uint64               `msg:"vs"` // Versions that are not delete markers.
+	DeleteMarkers    uint64               `msg:"dms"`
 	ObjSizes         sizeHistogram        `msg:"szs"`
+	ObjVersions      versionsHistogram    `msg:"vh"`
 	ReplicationStats *replicationAllStats `msg:"rs,omitempty"`
 	AllTierStats     *allTierStats        `msg:"ats,omitempty"`
 	Compacted        bool                 `msg:"c"`
@@ -80,6 +87,20 @@ func (ats *allTierStats) merge(other *allTierStats) {
 	for tier, st := range other.Tiers {
 		ats.Tiers[tier] = ats.Tiers[tier].add(st)
 	}
+}
+
+func (ats *allTierStats) clone() *allTierStats {
+	if ats == nil {
+		return nil
+	}
+	dst := *ats
+	if dst.Tiers != nil {
+		dst.Tiers = make(map[string]tierStats, len(dst.Tiers))
+		for tier, st := range dst.Tiers {
+			dst.Tiers[tier] = st
+		}
+	}
+	return &dst
 }
 
 func (ats *allTierStats) adminStats(stats map[string]madmin.TierStats) map[string]madmin.TierStats {
@@ -160,6 +181,25 @@ type replicationAllStats struct {
 type replicationAllStatsV1 struct {
 	Targets     map[string]replicationStats
 	ReplicaSize uint64 `msg:"ReplicaSize,omitempty"`
+}
+
+// clone creates a deep-copy clone.
+func (r *replicationAllStats) clone() *replicationAllStats {
+	if r == nil {
+		return nil
+	}
+
+	// Shallow copy
+	dst := *r
+
+	// Copy individual targets.
+	if dst.Targets != nil {
+		dst.Targets = make(map[string]replicationStats, len(dst.Targets))
+		for k, v := range r.Targets {
+			dst.Targets[k] = v
+		}
+	}
+	return &dst
 }
 
 //msgp:encode ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4 dataUsageEntryV5 dataUsageEntryV6
@@ -275,7 +315,6 @@ type dataUsageCacheInfo struct {
 	// indicates if the disk is being healed and scanner
 	// should skip healing the disk
 	SkipHealing bool
-	BloomFilter []byte `msg:"BloomFilter,omitempty"`
 
 	// Active lifecycle, if any on the bucket
 	lifeCycle *lifecycle.Lifecycle `msg:"-"`
@@ -290,7 +329,9 @@ type dataUsageCacheInfo struct {
 func (e *dataUsageEntry) addSizes(summary sizeSummary) {
 	e.Size += summary.totalSize
 	e.Versions += summary.versions
+	e.DeleteMarkers += summary.deleteMarkers
 	e.ObjSizes.add(summary.totalSize)
+	e.ObjVersions.add(summary.versions)
 
 	if e.ReplicationStats == nil {
 		e.ReplicationStats = &replicationAllStats{
@@ -327,6 +368,7 @@ func (e *dataUsageEntry) addSizes(summary sizeSummary) {
 func (e *dataUsageEntry) merge(other dataUsageEntry) {
 	e.Objects += other.Objects
 	e.Versions += other.Versions
+	e.DeleteMarkers += other.DeleteMarkers
 	e.Size += other.Size
 	if other.ReplicationStats != nil {
 		if e.ReplicationStats == nil {
@@ -349,6 +391,10 @@ func (e *dataUsageEntry) merge(other dataUsageEntry) {
 
 	for i, v := range other.ObjSizes[:] {
 		e.ObjSizes[i] += v
+	}
+
+	for i, v := range other.ObjVersions[:] {
+		e.ObjVersions[i] += v
 	}
 
 	if other.AllTierStats != nil {
@@ -392,13 +438,6 @@ func (e *dataUsageEntry) addChild(hash dataUsageHash) {
 	e.Children[hash.Key()] = struct{}{}
 }
 
-// removeChild will remove a child based on its hash.
-func (e *dataUsageEntry) removeChild(hash dataUsageHash) {
-	if len(e.Children) > 0 {
-		delete(e.Children, hash.Key())
-	}
-}
-
 // Create a clone of the entry.
 func (e dataUsageEntry) clone() dataUsageEntry {
 	// We operate on a copy from the receiver.
@@ -410,14 +449,11 @@ func (e dataUsageEntry) clone() dataUsageEntry {
 		e.Children = ch
 	}
 	if e.ReplicationStats != nil {
-		// Copy to new struct
-		r := *e.ReplicationStats
-		e.ReplicationStats = &r
+		// Clone ReplicationStats
+		e.ReplicationStats = e.ReplicationStats.clone()
 	}
 	if e.AllTierStats != nil {
-		ats := newAllTierStats()
-		ats.merge(e.AllTierStats)
-		e.AllTierStats = ats
+		e.AllTierStats = e.AllTierStats.clone()
 	}
 	return e
 }
@@ -488,43 +524,6 @@ func (d *dataUsageCache) deleteRecursive(h dataUsageHash) {
 	}
 }
 
-// keepBuckets will keep only the buckets specified specified by delete all others.
-func (d *dataUsageCache) keepBuckets(b []BucketInfo) {
-	lu := make(map[dataUsageHash]struct{})
-	for _, v := range b {
-		lu[hashPath(v.Name)] = struct{}{}
-	}
-	d.keepRootChildren(lu)
-}
-
-// keepRootChildren will keep the root children specified by delete all others.
-func (d *dataUsageCache) keepRootChildren(list map[dataUsageHash]struct{}) {
-	root := d.root()
-	if root == nil {
-		return
-	}
-	rh := d.rootHash()
-	for k := range d.Cache {
-		h := dataUsageHash(k)
-		if h == rh {
-			continue
-		}
-		if _, ok := list[h]; !ok {
-			delete(d.Cache, k)
-			d.deleteRecursive(h)
-			root.removeChild(h)
-		}
-	}
-	// Clean up abandoned children.
-	for k := range root.Children {
-		h := dataUsageHash(k)
-		if _, ok := list[h]; !ok {
-			delete(root.Children, k)
-		}
-	}
-	d.Cache[rh.Key()] = *root
-}
-
 // dui converts the flattened version of the path to madmin.DataUsageInfo.
 // As a side effect d will be flattened, use a clone if this is not ok.
 func (d *dataUsageCache) dui(path string, buckets []BucketInfo) DataUsageInfo {
@@ -535,12 +534,14 @@ func (d *dataUsageCache) dui(path string, buckets []BucketInfo) DataUsageInfo {
 	}
 	flat := d.flatten(*e)
 	dui := DataUsageInfo{
-		LastUpdate:        d.Info.LastUpdate,
-		ObjectsTotalCount: flat.Objects,
-		ObjectsTotalSize:  uint64(flat.Size),
-		BucketsCount:      uint64(len(e.Children)),
-		BucketsUsage:      d.bucketsUsageInfo(buckets),
-		TierStats:         d.tiersUsageInfo(buckets),
+		LastUpdate:              d.Info.LastUpdate,
+		ObjectsTotalCount:       flat.Objects,
+		VersionsTotalCount:      flat.Versions,
+		DeleteMarkersTotalCount: flat.DeleteMarkers,
+		ObjectsTotalSize:        uint64(flat.Size),
+		BucketsCount:            uint64(len(e.Children)),
+		BucketsUsage:            d.bucketsUsageInfo(buckets),
+		TierStats:               d.tiersUsageInfo(buckets),
 	}
 	return dui
 }
@@ -691,10 +692,7 @@ func (d *dataUsageCache) reduceChildrenOf(path dataUsageHash, limit int, compact
 // StringAll returns a detailed string representation of all entries in the cache.
 func (d *dataUsageCache) StringAll() string {
 	// Remove bloom filter from print.
-	bf := d.Info.BloomFilter
-	d.Info.BloomFilter = nil
 	s := fmt.Sprintf("info:%+v\n", d.Info)
-	d.Info.BloomFilter = bf
 	for k, v := range d.Cache {
 		s += fmt.Sprintf("\t%v: %+v\n", k, v)
 	}
@@ -740,7 +738,7 @@ func (d *dataUsageCache) flatten(root dataUsageEntry) dataUsageEntry {
 func (h *sizeHistogram) add(size int64) {
 	// Fetch the histogram interval corresponding
 	// to the passed object size.
-	for i, interval := range ObjectsHistogramIntervals {
+	for i, interval := range ObjectsHistogramIntervals[:] {
 		if size >= interval.start && size <= interval.end {
 			h[i]++
 			break
@@ -753,6 +751,27 @@ func (h *sizeHistogram) toMap() map[string]uint64 {
 	res := make(map[string]uint64, dataUsageBucketLen)
 	for i, count := range h {
 		res[ObjectsHistogramIntervals[i].name] = count
+	}
+	return res
+}
+
+// add a version count to the histogram.
+func (h *versionsHistogram) add(versions uint64) {
+	// Fetch the histogram interval corresponding
+	// to the passed object size.
+	for i, interval := range ObjectsVersionCountIntervals[:] {
+		if versions >= uint64(interval.start) && versions <= uint64(interval.end) {
+			h[i]++
+			break
+		}
+	}
+}
+
+// toMap returns the map to a map[string]uint64.
+func (h *versionsHistogram) toMap() map[string]uint64 {
+	res := make(map[string]uint64, dataUsageVersionLen)
+	for i, count := range h {
+		res[ObjectsVersionCountIntervals[i].name] = count
 	}
 	return res
 }
@@ -787,9 +806,12 @@ func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]Bucke
 		}
 		flat := d.flatten(*e)
 		bui := BucketUsageInfo{
-			Size:                 uint64(flat.Size),
-			ObjectsCount:         flat.Objects,
-			ObjectSizesHistogram: flat.ObjSizes.toMap(),
+			Size:                    uint64(flat.Size),
+			VersionsCount:           flat.Versions,
+			ObjectsCount:            flat.Objects,
+			DeleteMarkersCount:      flat.DeleteMarkers,
+			ObjectSizesHistogram:    flat.ObjSizes.toMap(),
+			ObjectVersionsHistogram: flat.ObjVersions.toMap(),
 		}
 		if flat.ReplicationStats != nil {
 			bui.ReplicaSize = flat.ReplicationStats.ReplicaSize
@@ -886,48 +908,80 @@ func (d *dataUsageCache) merge(other dataUsageCache) {
 }
 
 type objectIO interface {
-	GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (reader *GetObjectReader, err error)
+	GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (reader *GetObjectReader, err error)
 	PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error)
 }
 
 // load the cache content with name from minioMetaBackgroundOpsBucket.
 // Only backend errors are returned as errors.
+// The loader is optimistic and has no locking, but tries 5 times before giving up.
 // If the object is not found or unable to deserialize d is cleared and nil error is returned.
 func (d *dataUsageCache) load(ctx context.Context, store objectIO, name string) error {
 	// Abandon if more than 5 minutes, so we don't hold up scanner.
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	r, err := store.GetObjectNInfo(ctx, dataUsageBucket, name, nil, http.Header{}, readLock, ObjectOptions{})
-	if err != nil {
-		switch err.(type) {
-		case ObjectNotFound:
-		case BucketNotFound:
-		case InsufficientReadQuorum:
-		case StorageErr:
-		default:
-			return toObjectErr(err, dataUsageBucket, name)
+	// Caches are read+written without locks,
+	retries := 0
+	for retries < 5 {
+		r, err := store.GetObjectNInfo(ctx, dataUsageBucket, name, nil, http.Header{}, ObjectOptions{NoLock: true})
+		if err != nil {
+			switch err.(type) {
+			case ObjectNotFound, BucketNotFound:
+			case InsufficientReadQuorum, StorageErr:
+				retries++
+				time.Sleep(time.Duration(rand.Int63n(int64(time.Second))))
+				continue
+			default:
+				return toObjectErr(err, dataUsageBucket, name)
+			}
+			*d = dataUsageCache{}
+			return nil
 		}
-		*d = dataUsageCache{}
+		if err := d.deserialize(r); err != nil {
+			r.Close()
+			retries++
+			time.Sleep(time.Duration(rand.Int63n(int64(time.Second))))
+			continue
+		}
+		r.Close()
 		return nil
 	}
-	defer r.Close()
-	if err := d.deserialize(r); err != nil {
-		*d = dataUsageCache{}
-		logger.LogOnceIf(ctx, err, err.Error())
-	}
+	*d = dataUsageCache{}
 	return nil
 }
 
-// save the content of the cache to minioMetaBackgroundOpsBucket with the provided name.
-func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) error {
-	pr, pw := io.Pipe()
-	go func() {
-		pw.CloseWithError(d.serializeTo(pw))
-	}()
-	defer pr.Close()
+// Maximum running concurrent saves on server.
+var maxConcurrentScannerSaves = make(chan struct{}, 4)
 
-	r, err := hash.NewReader(pr, -1, "", "", -1)
+// save the content of the cache to minioMetaBackgroundOpsBucket with the provided name.
+// Note that no locking is done when saving.
+func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) error {
+	var r io.Reader
+	maxConcurrentScannerSaves <- struct{}{}
+	defer func() {
+		<-maxConcurrentScannerSaves
+	}()
+	// If big, do streaming...
+	size := int64(-1)
+	if len(d.Cache) > 10000 {
+		pr, pw := io.Pipe()
+		go func() {
+			pw.CloseWithError(d.serializeTo(pw))
+		}()
+		defer pr.Close()
+		r = pr
+	} else {
+		var buf bytes.Buffer
+		err := d.serializeTo(&buf)
+		if err != nil {
+			return err
+		}
+		r = &buf
+		size = int64(buf.Len())
+	}
+
+	hr, err := hash.NewReader(r, size, "", "", size)
 	if err != nil {
 		return err
 	}
@@ -938,8 +992,8 @@ func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) 
 	_, err = store.PutObject(ctx,
 		dataUsageBucket,
 		name,
-		NewPutObjReader(r),
-		ObjectOptions{})
+		NewPutObjReader(hr),
+		ObjectOptions{NoLock: true})
 	if isErrBucketNotFound(err) {
 		return nil
 	}
@@ -1320,4 +1374,20 @@ func (z dataUsageHashMap) Msgsize() (s int) {
 		s += msgp.StringPrefixSize + len(zb0004)
 	}
 	return
+}
+
+//msgp:encode ignore currentScannerCycle
+//msgp:decode ignore currentScannerCycle
+
+type currentScannerCycle struct {
+	current        uint64
+	next           uint64
+	started        time.Time
+	cycleCompleted []time.Time
+}
+
+// clone returns a clone.
+func (z currentScannerCycle) clone() currentScannerCycle {
+	z.cycleCompleted = append(make([]time.Time, 0, len(z.cycleCompleted)), z.cycleCompleted...)
+	return z
 }

@@ -43,6 +43,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.WebhookQueueDir,
@@ -191,6 +192,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.KafkaSASLMechanism,
@@ -287,6 +289,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.MqttQoS,
@@ -438,6 +441,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.NATSToken,
@@ -445,6 +449,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.NATSTLS,
@@ -463,30 +468,6 @@ var (
 			Description: "client ping commands interval in s,m,h,d. Disabled by default",
 			Optional:    true,
 			Type:        "duration",
-		},
-		config.HelpKV{
-			Key:         target.NATSStreaming,
-			Description: "set to 'on', to use streaming NATS server",
-			Optional:    true,
-			Type:        "on|off",
-		},
-		config.HelpKV{
-			Key:         target.NATSStreamingAsync,
-			Description: "set to 'on', to enable asynchronous publish",
-			Optional:    true,
-			Type:        "on|off",
-		},
-		config.HelpKV{
-			Key:         target.NATSStreamingMaxPubAcksInFlight,
-			Description: "number of messages to publish without waiting for ACKs",
-			Optional:    true,
-			Type:        "number",
-		},
-		config.HelpKV{
-			Key:         target.NATSStreamingClusterID,
-			Description: "unique ID for NATS streaming cluster",
-			Optional:    true,
-			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         target.NATSCertAuthority,
@@ -510,6 +491,12 @@ var (
 			Sensitive:   true,
 		},
 		config.HelpKV{
+			Key:         target.NATSJetStream,
+			Description: "enable JetStream support",
+			Optional:    true,
+			Type:        "on|off",
+		},
+		config.HelpKV{
 			Key:         target.NATSQueueDir,
 			Description: queueDirComment,
 			Optional:    true,
@@ -520,6 +507,30 @@ var (
 			Description: queueLimitComment,
 			Optional:    true,
 			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         target.NATSStreaming,
+			Description: "[DEPRECATED] set to 'on', to use streaming NATS server",
+			Optional:    true,
+			Type:        "on|off",
+		},
+		config.HelpKV{
+			Key:         target.NATSStreamingAsync,
+			Description: "[DEPRECATED] set to 'on', to enable asynchronous publish",
+			Optional:    true,
+			Type:        "on|off",
+		},
+		config.HelpKV{
+			Key:         target.NATSStreamingMaxPubAcksInFlight,
+			Description: "[DEPRECATED] number of messages to publish without waiting for ACKs",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         target.NATSStreamingClusterID,
+			Description: "[DEPRECATED] unique ID for NATS streaming cluster",
+			Optional:    true,
+			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         config.Comment,
@@ -615,6 +626,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         config.Comment,
@@ -648,6 +660,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.RedisQueueDir,

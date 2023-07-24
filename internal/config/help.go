@@ -25,9 +25,13 @@ type HelpKV struct {
 	Description string `json:"description"`
 	Optional    bool   `json:"optional"`
 
-	// Indicates if the value contains sensitive info
-	// that shouldn't be exposed in certain apis
+	// Indicates if the value contains sensitive info that shouldn't be exposed
+	// in certain apis (such as Health Diagnostics/Callhome)
 	Sensitive bool `json:"-"`
+
+	// Indicates if the value is a secret such as a password that shouldn't be
+	// exposed by the server
+	Secret bool `json:"-"`
 
 	// Indicates if sub-sys supports multiple targets.
 	MultipleTargets bool `json:"multipleTargets"`
@@ -87,3 +91,12 @@ var (
 		},
 	}
 )
+
+// DefaultHelpPostfix - Helper function to add (default: $value) messages in config help
+func DefaultHelpPostfix(subsystem KVS, key string) string {
+	val, found := subsystem.Lookup(key)
+	if !found || val == "" {
+		return ""
+	}
+	return " (default: '" + val + "')"
+}

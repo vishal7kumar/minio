@@ -27,9 +27,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go"
-	minio "github.com/minio/minio-go/v7"
-	miniogo "github.com/minio/minio-go/v7"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
@@ -80,7 +79,7 @@ func (s3 *warmBackendS3) Get(ctx context.Context, object string, rv remoteVersio
 			return nil, s3.ToObjectError(err, object)
 		}
 	}
-	c := &miniogo.Core{Client: s3.client}
+	c := &minio.Core{Client: s3.client}
 	// Important to use core primitives here to pass range get options as is.
 	r, _, _, err := c.GetObject(ctx, s3.Bucket, s3.getDest(object), gopts)
 	if err != nil {
@@ -106,7 +105,7 @@ func (s3 *warmBackendS3) InUse(ctx context.Context) (bool, error) {
 	return len(result.CommonPrefixes) > 0 || len(result.Contents) > 0, nil
 }
 
-func newWarmBackendS3(conf madmin.TierS3) (*warmBackendS3, error) {
+func newWarmBackendS3(conf madmin.TierS3, tier string) (*warmBackendS3, error) {
 	u, err := url.Parse(conf.Endpoint)
 	if err != nil {
 		return nil, err
@@ -118,7 +117,7 @@ func newWarmBackendS3(conf madmin.TierS3) (*warmBackendS3, error) {
 		creds = credentials.NewStaticV4(conf.AccessKey, conf.SecretKey, "")
 	}
 	getRemoteTierTargetInstanceTransportOnce.Do(func() {
-		getRemoteTierTargetInstanceTransport = newGatewayHTTPTransport(10 * time.Minute)
+		getRemoteTierTargetInstanceTransport = NewHTTPTransportWithTimeout(10 * time.Minute)
 	})
 	opts := &minio.Options{
 		Creds:     creds,
@@ -129,10 +128,9 @@ func newWarmBackendS3(conf madmin.TierS3) (*warmBackendS3, error) {
 	if err != nil {
 		return nil, err
 	}
-	core, err := minio.NewCore(u.Host, opts)
-	if err != nil {
-		return nil, err
-	}
+	client.SetAppInfo(fmt.Sprintf("s3-tier-%s", tier), ReleaseTag)
+
+	core := &minio.Core{Client: client}
 	return &warmBackendS3{
 		client:       client,
 		core:         core,

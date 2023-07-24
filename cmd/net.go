@@ -44,9 +44,8 @@ func mustSplitHostPort(hostPort string) (host, port string) {
 	return xh.Name, xh.Port.String()
 }
 
-// mustGetLocalIP4 returns IPv4 addresses of localhost.  It panics on error.
-func mustGetLocalIP4() (ipList set.StringSet) {
-	ipList = set.NewStringSet()
+// mustGetLocalIPs returns IPs of local interface
+func mustGetLocalIPs() (ipList []net.IP) {
 	ifs, err := net.Interfaces()
 	logger.FatalIf(err, "Unable to get IP addresses of this host")
 
@@ -68,36 +67,33 @@ func mustGetLocalIP4() (ipList set.StringSet) {
 				ip = v.IP
 			}
 
-			if ip.To4() != nil {
-				ipList.Add(ip.String())
-			}
+			ipList = append(ipList, ip)
 		}
 	}
 
 	return ipList
 }
 
+// mustGetLocalIP4 returns IPv4 addresses of localhost.  It panics on error.
+func mustGetLocalIP4() (ipList set.StringSet) {
+	ipList = set.NewStringSet()
+	for _, ip := range mustGetLocalIPs() {
+		if ip.To4() != nil {
+			ipList.Add(ip.String())
+		}
+	}
+	return
+}
+
 // mustGetLocalIP6 returns IPv6 addresses of localhost.  It panics on error.
 func mustGetLocalIP6() (ipList set.StringSet) {
 	ipList = set.NewStringSet()
-	addrs, err := net.InterfaceAddrs()
-	logger.FatalIf(err, "Unable to get IP addresses of this host")
-
-	for _, addr := range addrs {
-		var ip net.IP
-		switch v := addr.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		}
-
+	for _, ip := range mustGetLocalIPs() {
 		if ip.To4() == nil {
 			ipList.Add(ip.String())
 		}
 	}
-
-	return ipList
+	return
 }
 
 // getHostIP returns IP address of given host.
@@ -113,25 +109,6 @@ func getHostIP(host string) (ipList set.StringSet, err error) {
 	}
 
 	return ipList, err
-}
-
-// byLastOctetValue implements sort.Interface used in sorting a list
-// of ip address by their last octet value in descending order.
-type byLastOctetValue []net.IP
-
-func (n byLastOctetValue) Len() int      { return len(n) }
-func (n byLastOctetValue) Swap(i, j int) { n[i], n[j] = n[j], n[i] }
-func (n byLastOctetValue) Less(i, j int) bool {
-	// This case is needed when all ips in the list
-	// have same last octets, Following just ensures that
-	// 127.0.0.1 is moved to the end of the list.
-	if n[i].IsLoopback() {
-		return false
-	}
-	if n[j].IsLoopback() {
-		return true
-	}
-	return []byte(n[i].To4())[3] > []byte(n[j].To4())[3]
 }
 
 // sortIPs - sort ips based on higher octects.
@@ -156,7 +133,18 @@ func sortIPs(ipList []string) []string {
 		}
 	}
 
-	sort.Sort(byLastOctetValue(ipV4s))
+	sort.Slice(ipV4s, func(i, j int) bool {
+		// This case is needed when all ips in the list
+		// have same last octets, Following just ensures that
+		// 127.0.0.1 is moved to the end of the list.
+		if ipV4s[i].IsLoopback() {
+			return false
+		}
+		if ipV4s[j].IsLoopback() {
+			return true
+		}
+		return []byte(ipV4s[i].To4())[3] > []byte(ipV4s[j].To4())[3]
+	})
 
 	var ips []string
 	for _, ip := range ipV4s {
@@ -217,19 +205,6 @@ func isHostIP(ipAddress string) bool {
 		host = host[:i]
 	}
 	return net.ParseIP(host) != nil
-}
-
-// checkPortAvailability - check if given host and port is already in use.
-// Note: The check method tries to listen on given port and closes it.
-// It is possible to have a disconnected client in this tiny window of time.
-func checkPortAvailability(host, port string) (err error) {
-	l, err := net.Listen("tcp", net.JoinHostPort(host, port))
-	if err != nil {
-		return err
-	}
-	// As we are able to listen on this network, the port is not in use.
-	// Close the listener and continue check other networks.
-	return l.Close()
 }
 
 // extractHostPort - extracts host/port from many address formats
@@ -322,7 +297,8 @@ func isLocalHost(host string, port string, localPort string) (bool, error) {
 
 // sameLocalAddrs - returns true if two addresses, even with different
 // formats, point to the same machine, e.g:
-//  ':9000' and 'http://localhost:9000/' will return true
+//
+//	':9000' and 'http://localhost:9000/' will return true
 func sameLocalAddrs(addr1, addr2 string) (bool, error) {
 	// Extract host & port from given parameters
 	host1, port1, err := extractHostPort(addr1)

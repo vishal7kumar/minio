@@ -580,8 +580,8 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			}
 		}
 		if object.VersionID != "" && hasLockEnabled {
-			if apiErrCode := enforceRetentionBypassForDelete(ctx, r, bucket, object, goi, gerr); apiErrCode != ErrNone {
-				apiErr := errorCodes.ToAPIErr(apiErrCode)
+			if err := enforceRetentionBypassForDelete(ctx, r, bucket, object, goi, gerr); err != nil {
+				apiErr := toAPIError(ctx, err)
 				deleteResults[index].errInfo = DeleteError{
 					Code:      apiErr.Code,
 					Message:   apiErr.Description,
@@ -1621,10 +1621,14 @@ func (api objectAPIHandlers) DeleteBucketHandler(w http.ResponseWriter, r *http.
 		}
 	}
 
-	deleteBucket := objectAPI.DeleteBucket
+	// Return an error if the bucket does not exist
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil && !forceDelete {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
 
 	// Attempt to delete bucket.
-	if err := deleteBucket(ctx, bucket, DeleteBucketOptions{
+	if err := objectAPI.DeleteBucket(ctx, bucket, DeleteBucketOptions{
 		Force:      forceDelete,
 		SRDeleteOp: getSRBucketDeleteOp(globalSiteReplicationSys.isEnabled()),
 	}); err != nil {

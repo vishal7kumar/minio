@@ -214,6 +214,9 @@ func (client *peerRESTClient) GetMetrics(ctx context.Context, t madmin.MetricTyp
 	for disk := range opts.disks {
 		values.Set(peerRESTDisk, disk)
 	}
+	for host := range opts.hosts {
+		values.Add(peerRESTHost, host)
+	}
 	values.Set(peerRESTJobID, opts.jobID)
 	values.Set(peerRESTDepID, opts.depID)
 
@@ -839,6 +842,33 @@ func (client *peerRESTClient) GetPeerMetrics(ctx context.Context) (<-chan Metric
 	return ch, nil
 }
 
+func (client *peerRESTClient) GetPeerBucketMetrics(ctx context.Context) (<-chan Metric, error) {
+	respBody, err := client.callWithContext(ctx, peerRESTMethodGetPeerBucketMetrics, nil, nil, -1)
+	if err != nil {
+		return nil, err
+	}
+	dec := gob.NewDecoder(respBody)
+	ch := make(chan Metric)
+	go func(ch chan<- Metric) {
+		defer func() {
+			xhttp.DrainBody(respBody)
+			close(ch)
+		}()
+		for {
+			var metric Metric
+			if err := dec.Decode(&metric); err != nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- metric:
+			}
+		}
+	}(ch)
+	return ch, nil
+}
+
 func (client *peerRESTClient) SpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, error) {
 	values := make(url.Values)
 	values.Set(peerRESTSize, strconv.Itoa(opts.objectSize))
@@ -943,4 +973,35 @@ func (client *peerRESTClient) Netperf(ctx context.Context, duration time.Duratio
 	defer xhttp.DrainBody(respBody)
 	err = gob.NewDecoder(respBody).Decode(&result)
 	return result, err
+}
+
+// GetReplicationMRF - get replication MRF for bucket
+func (client *peerRESTClient) GetReplicationMRF(ctx context.Context, bucket string) (chan madmin.ReplicationMRF, error) {
+	values := make(url.Values)
+	values.Set(peerRESTBucket, bucket)
+
+	respBody, err := client.callWithContext(ctx, peerRESTMethodGetReplicationMRF, values, nil, -1)
+	if err != nil {
+		return nil, err
+	}
+	dec := gob.NewDecoder(respBody)
+	ch := make(chan madmin.ReplicationMRF)
+	go func(ch chan madmin.ReplicationMRF) {
+		defer func() {
+			xhttp.DrainBody(respBody)
+			close(ch)
+		}()
+		for {
+			var entry madmin.ReplicationMRF
+			if err := dec.Decode(&entry); err != nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- entry:
+			}
+		}
+	}(ch)
+	return ch, nil
 }

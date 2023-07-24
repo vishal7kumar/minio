@@ -395,6 +395,9 @@ var (
 
 	// Use to set custom owner id and display name
 	globalOwnerID = globalMinioDefaultOwnerID
+	// Contains NIC interface name used for internode communication
+	globalInternodeInterface     string
+	globalInternodeInterfaceOnce sync.Once
 
 	// Add new variable global values here.
 

@@ -245,6 +245,7 @@ func (p *poolMeta) QueueBuckets(idx int, buckets []decomBucketInfo) {
 var (
 	errDecommissionAlreadyRunning = errors.New("decommission is already in progress")
 	errDecommissionComplete       = errors.New("decommission is complete, please remove the servers from command-line")
+	errDecommissionNotStarted     = errors.New("decommission is not in progress")
 )
 
 func (p *poolMeta) Decommission(idx int, pi poolSpaceInfo) error {
@@ -695,7 +696,9 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 	// Check if bucket is object locked.
 	lr, _ := globalBucketObjectLockSys.Get(bi.Name)
 
-	for _, set := range pool.sets {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for setIdx, set := range pool.sets {
 		set := set
 
 		filterLifecycle := func(bucket, object string, fi FileInfo) bool {
@@ -894,16 +897,26 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 		}
 
 		wk.Take()
-		go func() {
+		go func(setIdx int) {
 			defer wk.Give()
-			err := set.listObjectsToDecommission(ctx, bi,
-				func(entry metaCacheEntry) {
-					wk.Take()
-					go decommissionEntry(entry)
-				},
-			)
-			logger.LogIf(ctx, err)
-		}()
+			// We will perpetually retry listing if it fails, since we cannot
+			// possibly give up in this matter
+			for {
+				err := set.listObjectsToDecommission(ctx, bi,
+					func(entry metaCacheEntry) {
+						wk.Take()
+						go decommissionEntry(entry)
+					},
+				)
+				if err == nil {
+					break
+				}
+				setN := humanize.Ordinal(setIdx + 1)
+				retryDur := time.Duration(r.Float64() * float64(5*time.Second))
+				logger.LogOnceIf(ctx, fmt.Errorf("listing objects from %s set failed with %v, retrying in %v", setN, err, retryDur), "decom-listing-failed"+setN)
+				time.Sleep(retryDur)
+			}
+		}(setIdx)
 	}
 	wk.Wait()
 	return nil
@@ -1183,7 +1196,11 @@ func (z *erasureServerPools) Status(ctx context.Context, idx int) (PoolStatus, e
 	poolInfo := z.poolMeta.Pools[idx]
 	if poolInfo.Decommission != nil {
 		poolInfo.Decommission.TotalSize = pi.Total
-		poolInfo.Decommission.CurrentSize = poolInfo.Decommission.StartSize + poolInfo.Decommission.BytesDone
+		if poolInfo.Decommission.Failed || poolInfo.Decommission.Canceled {
+			poolInfo.Decommission.CurrentSize = pi.Free
+		} else {
+			poolInfo.Decommission.CurrentSize = poolInfo.Decommission.StartSize + poolInfo.Decommission.BytesDone
+		}
 	} else {
 		poolInfo.Decommission = &PoolDecommissionInfo{
 			TotalSize:   pi.Total,
@@ -1219,15 +1236,21 @@ func (z *erasureServerPools) DecommissionCancel(ctx context.Context, idx int) (e
 	z.poolMetaMutex.Lock()
 	defer z.poolMetaMutex.Unlock()
 
+	fn := z.decommissionCancelers[idx]
+	if fn == nil {
+		// canceling a decommission before it started return an error.
+		return errDecommissionNotStarted
+	}
+
+	defer fn() // cancel any active thread.
+
 	if z.poolMeta.DecommissionCancel(idx) {
-		if fn := z.decommissionCancelers[idx]; fn != nil {
-			defer fn() // cancel any active thread.
-		}
 		if err = z.poolMeta.save(ctx, z.serverPools); err != nil {
 			return err
 		}
 		globalNotificationSys.ReloadPoolMeta(ctx)
 	}
+
 	return nil
 }
 
@@ -1245,8 +1268,9 @@ func (z *erasureServerPools) DecommissionFailed(ctx context.Context, idx int) (e
 
 	if z.poolMeta.DecommissionFailed(idx) {
 		if fn := z.decommissionCancelers[idx]; fn != nil {
-			defer fn() // cancel any active thread.
-		}
+			defer fn()
+		} // cancel any active thread.
+
 		if err = z.poolMeta.save(ctx, z.serverPools); err != nil {
 			return err
 		}
@@ -1269,8 +1293,9 @@ func (z *erasureServerPools) CompleteDecommission(ctx context.Context, idx int) 
 
 	if z.poolMeta.DecommissionComplete(idx) {
 		if fn := z.decommissionCancelers[idx]; fn != nil {
-			defer fn() // cancel any active thread.
-		}
+			defer fn()
+		} // cancel any active thread.
+
 		if err = z.poolMeta.save(ctx, z.serverPools); err != nil {
 			return err
 		}
